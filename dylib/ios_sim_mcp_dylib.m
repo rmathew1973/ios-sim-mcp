@@ -294,6 +294,104 @@ static UIResponder *ism_find_first_responder(void) {
     return nil;
 }
 
+#pragma mark - View introspection helpers (main-thread only)
+
+static NSString *ism_view_text_content(UIView *view) {
+    // Prefer the most specific accessor per type. valueForKey would technically
+    // work for several of these but is more fragile and has KVC-undefined edge
+    // cases on some subclasses.
+    if ([view isKindOfClass:[UILabel class]]) return ((UILabel *)view).text;
+    if ([view isKindOfClass:[UITextField class]]) return ((UITextField *)view).text;
+    if ([view isKindOfClass:[UITextView class]]) return ((UITextView *)view).text;
+    if ([view isKindOfClass:[UIButton class]]) {
+        UIButton *b = (UIButton *)view;
+        return b.currentTitle ?: b.titleLabel.text;
+    }
+    return nil;
+}
+
+static UIViewController *ism_owning_vc_if_root(UIView *view) {
+    // Walk the responder chain. If the *first* UIViewController we encounter has
+    // `view` as its loaded root view, this view is the VC's root; annotate it.
+    UIResponder *r = view.nextResponder;
+    while (r) {
+        if ([r isKindOfClass:[UIViewController class]]) {
+            UIViewController *vc = (UIViewController *)r;
+            return (vc.viewIfLoaded == view) ? vc : nil;
+        }
+        r = r.nextResponder;
+    }
+    return nil;
+}
+
+static NSDictionary *ism_frame_dict(CGRect r) {
+    return @{
+        @"x": @(r.origin.x),
+        @"y": @(r.origin.y),
+        @"w": @(r.size.width),
+        @"h": @(r.size.height),
+    };
+}
+
+static NSDictionary *ism_serialize_view(UIView *view,
+                                        UIWindow *window,
+                                        int depth,
+                                        int maxDepth,
+                                        BOOL filterVisible,
+                                        BOOL includeText,
+                                        int *nodeCounter,
+                                        int maxNodes,
+                                        BOOL *hitCap) {
+    if (*hitCap) return nil;
+    if (*nodeCounter >= maxNodes) { *hitCap = YES; return nil; }
+
+    if (filterVisible) {
+        if (view.isHidden) return nil;
+        if (view.alpha < 0.01) return nil;
+        if (CGRectIsEmpty(view.bounds)) return nil;
+    }
+
+    (*nodeCounter)++;
+    NSMutableDictionary *node = [NSMutableDictionary dictionary];
+    node[@"v"] = [NSString stringWithFormat:@"v%d", *nodeCounter];
+    node[@"class"] = NSStringFromClass([view class]);
+    node[@"frame"] = ism_frame_dict([view convertRect:view.bounds toView:window]);
+
+    if (view.alpha < 0.999) node[@"alpha"] = @(view.alpha);
+    if (view.isHidden) node[@"hidden"] = @YES;
+    if (!view.isUserInteractionEnabled) node[@"interactive"] = @NO;
+    if (view.tag != 0) node[@"tag"] = @(view.tag);
+
+    NSString *axId = view.accessibilityIdentifier;
+    if (axId.length) node[@"ax_id"] = axId;
+    NSString *axLabel = view.accessibilityLabel;
+    if (axLabel.length) node[@"ax_label"] = axLabel;
+    NSString *axValue = view.accessibilityValue;
+    if (axValue.length) node[@"ax_value"] = axValue;
+
+    if (includeText) {
+        NSString *text = ism_view_text_content(view);
+        if (text.length) node[@"text"] = text;
+    }
+
+    UIViewController *vc = ism_owning_vc_if_root(view);
+    if (vc) node[@"vc_class"] = NSStringFromClass([vc class]);
+
+    if (depth < maxDepth && view.subviews.count > 0) {
+        NSMutableArray *kids = [NSMutableArray array];
+        for (UIView *sub in view.subviews) {
+            NSDictionary *child = ism_serialize_view(sub, window, depth + 1, maxDepth,
+                                                    filterVisible, includeText,
+                                                    nodeCounter, maxNodes, hitCap);
+            if (child) [kids addObject:child];
+            if (*hitCap) break;
+        }
+        if (kids.count) node[@"children"] = kids;
+    }
+
+    return node;
+}
+
 #pragma mark - Builtin methods
 
 static void ism_register_builtins(NSString *bundleId, NSString *processName, NSString *bundlePath) {
@@ -373,6 +471,125 @@ static void ism_register_builtins(NSString *bundleId, NSString *processName, NSS
             @"chars": @(text.length),
             @"responder": responderClass ?: @"",
         };
+    });
+
+    // view_tree: walks UIWindowScene.windows → root views → subviews recursively
+    // on the main queue. Returns per-window trees with class, frame (in window
+    // coords), accessibility, text content for known leaf types, and a vc_class
+    // annotation when the view is the root view of a UIViewController.
+    //
+    // Params:
+    //   max_depth          (number, default 30)
+    //   max_nodes          (number, default 1500) — caps walk to keep responses
+    //                      sized; hit_cap=true in response when truncated.
+    //   include_invisible  (bool,   default false) — by default skip hidden /
+    //                      α≈0 / zero-size views.
+    //   include_text       (bool,   default true)  — UILabel/UIButton/etc text.
+    ism_register_method(@"view_tree", ^NSDictionary *(NSDictionary *params) {
+        int maxDepth = 30, maxNodes = 1500;
+        BOOL filterVisible = YES, includeText = YES;
+        id v;
+        if ((v = params[@"max_depth"])         && [v isKindOfClass:[NSNumber class]]) maxDepth = [v intValue];
+        if ((v = params[@"max_nodes"])         && [v isKindOfClass:[NSNumber class]]) maxNodes = [v intValue];
+        if ((v = params[@"include_invisible"]) && [v isKindOfClass:[NSNumber class]]) filterVisible = ![v boolValue];
+        if ((v = params[@"include_text"])      && [v isKindOfClass:[NSNumber class]]) includeText = [v boolValue];
+
+        __block NSMutableArray *windowsOut = [NSMutableArray array];
+        __block int nodeCounter = 0;
+        __block BOOL hitCap = NO;
+
+        dispatch_sync(dispatch_get_main_queue(), ^{
+            for (UIWindow *window in ism_all_windows()) {
+                NSDictionary *root = ism_serialize_view(window, window, 0, maxDepth,
+                                                        filterVisible, includeText,
+                                                        &nodeCounter, maxNodes, &hitCap);
+                if (!root) continue;
+
+                NSMutableDictionary *winDict = [root mutableCopy];
+                winDict[@"is_key_window"] = @(window.isKeyWindow);
+                UIViewController *rootVC = window.rootViewController;
+                if (rootVC) {
+                    winDict[@"root_vc_class"] = NSStringFromClass([rootVC class]);
+                    UIViewController *deepest = rootVC;
+                    while (deepest.presentedViewController) deepest = deepest.presentedViewController;
+                    if (deepest != rootVC) {
+                        winDict[@"presented_vc_class"] = NSStringFromClass([deepest class]);
+                    }
+                }
+                [windowsOut addObject:winDict];
+                if (hitCap) break;
+            }
+        });
+
+        return @{
+            @"windows": windowsOut,
+            @"total_nodes": @(nodeCounter),
+            @"hit_cap": @(hitCap),
+            @"max_nodes": @(maxNodes),
+            @"max_depth": @(maxDepth),
+        };
+    });
+
+    // view_hit_test: returns the topmost view at a window-coord point, plus the
+    // full responder chain. Useful for "what does a tap at (x,y) actually hit?"
+    // diagnosis when a control isn't reacting to taps as expected.
+    ism_register_method(@"view_hit_test", ^NSDictionary *(NSDictionary *params) {
+        id xVal = params[@"x"], yVal = params[@"y"];
+        if (![xVal isKindOfClass:[NSNumber class]] || ![yVal isKindOfClass:[NSNumber class]]) {
+            @throw [NSException exceptionWithName:@"BadParams"
+                                           reason:@"x and y must be numbers"
+                                         userInfo:nil];
+        }
+        CGPoint p = CGPointMake([xVal doubleValue], [yVal doubleValue]);
+
+        __block NSDictionary *result = nil;
+        dispatch_sync(dispatch_get_main_queue(), ^{
+            UIWindow *keyWindow = nil;
+            NSArray<UIWindow *> *windows = ism_all_windows();
+            for (UIWindow *w in windows) if (w.isKeyWindow) { keyWindow = w; break; }
+            if (!keyWindow) keyWindow = windows.firstObject;
+            if (!keyWindow) return;
+
+            UIView *hit = [keyWindow hitTest:p withEvent:nil];
+            if (!hit) { result = @{@"hit": [NSNull null], @"point": @{@"x": @(p.x), @"y": @(p.y)}}; return; }
+
+            NSMutableArray *chain = [NSMutableArray array];
+            UIResponder *r = hit;
+            while (r) {
+                NSMutableDictionary *e = [NSMutableDictionary dictionary];
+                e[@"class"] = NSStringFromClass([r class]);
+                if ([r isKindOfClass:[UIView class]]) {
+                    UIView *vw = (UIView *)r;
+                    e[@"frame"] = ism_frame_dict([vw convertRect:vw.bounds toView:keyWindow]);
+                    if (vw.accessibilityIdentifier.length) e[@"ax_id"] = vw.accessibilityIdentifier;
+                } else if ([r isKindOfClass:[UIViewController class]]) {
+                    e[@"is_vc"] = @YES;
+                }
+                [chain addObject:e];
+                r = r.nextResponder;
+            }
+
+            NSString *text = ism_view_text_content(hit);
+            CGRect hitFrame = [hit convertRect:hit.bounds toView:keyWindow];
+            result = @{
+                @"point": @{@"x": @(p.x), @"y": @(p.y)},
+                @"hit": @{
+                    @"class": NSStringFromClass([hit class]),
+                    @"frame": ism_frame_dict(hitFrame),
+                    @"ax_id": hit.accessibilityIdentifier ?: @"",
+                    @"ax_label": hit.accessibilityLabel ?: @"",
+                    @"text": text ?: @"",
+                    @"interactive": @(hit.isUserInteractionEnabled),
+                    @"alpha": @(hit.alpha),
+                },
+                @"responder_chain": chain,
+            };
+        });
+
+        if (!result) @throw [NSException exceptionWithName:@"NoKeyWindow"
+                                                   reason:@"no key window available"
+                                                 userInfo:nil];
+        return result;
     });
 }
 

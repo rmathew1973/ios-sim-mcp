@@ -85,6 +85,8 @@ It's a standard stdio MCP server. Run `bun run src/server.ts` and pipe JSON-RPC.
 | `tap` | Tap by `{ref}`, `{id}`, or `{x,y}`. Optional `duration` makes it a long-press |
 | `type_text` | Type into the focused field. Optional `{ref}` or `{id}` taps-then-types. Auto-routes through paste when the dylib is loaded for byte-perfect input — no iOS autocorrect, no first-letter capitalization. `via: "keystroke"` forces the typing path; `via: "paste"` forces the paste path |
 | `paste_text` | Byte-perfect text via `UIPasteboard` + first-responder `paste:`. Requires the dylib injected. The right answer for emails, passwords, OAuth tokens, anything case-sensitive |
+| `view_tree` | Walk the running app's `UIView` hierarchy on the main thread. Reports class names, frames in window coords, alpha/hidden/interactive, text content, and annotates view-controller boundaries. Strictly richer than `snapshot` — sees custom-drawn views, transient overlays, SwiftUI internals. Filter by `class_filter` / `ax_id_contains` / `text_contains`. Requires dylib injected |
+| `view_hit_test` | "What view actually receives a tap at (x,y)?" Returns the topmost view plus the full responder chain up to `UIApplication`. The right debugging tool when a `tap` isn't doing what you expect. Requires dylib injected |
 | `key` | Press a key by name (RETURN, ESC, DELETE, TAB, SPACE, F1–F12, arrows) or raw HID code |
 | `button` | Hardware button: HOME, LOCK, SIDE_BUTTON, SIRI, APPLE_PAY |
 | `swipe` | Swipe between two refs/ids/points. Optional `duration` and `delta` |
@@ -177,9 +179,26 @@ Build it once:
 
 The dylib is iOS-Simulator-flavored (`LC_BUILD_VERSION` platform 7, iOS 14+), only loads in apps you launch through this tool with `inject: true`, does not modify the app on disk, and leaves no trace after the process exits.
 
+## When to use `snapshot` vs `view_tree`
+
+Both inspect the running UI but they read different trees:
+
+| | `snapshot` (Layer 1, AX) | `view_tree` (Layer 2c, UIView) |
+|---|---|---|
+| Source | iOS accessibility tree | Live `UIView` hierarchy |
+| Needs dylib | No | Yes (`inject: true`) |
+| Latency | ~150 ms (subprocess) | ~5 ms (in-process) |
+| Sees `accessibilityIdentifier` on SwiftUI | **Yes** | No (SwiftUI doesn't propagate) |
+| Sees `accessibilityIdentifier` on UIKit | Yes (if set) | Yes (if set) |
+| Sees custom-drawn views | No (no AX node) | **Yes** |
+| Sees SwiftUI internals (`UIHostingController`, etc.) | Flattened | **Full hierarchy** |
+| Sees view-controller boundaries | No | **Yes** |
+| Sees alpha / isHidden / interactionEnabled | Partial | **Yes** |
+
+**Rule of thumb:** use `snapshot` + `find` for "tap this control" workflows (especially in SwiftUI apps); use `view_tree` for "what's actually on screen and why isn't this working" investigation.
+
 ## Roadmap
 
-- **Layer 2c** — `view_tree` handler that walks `UIApplication.windows` → root VCs → views.
 - **Layer 2d** — `URLProtocol` interceptor for network bodies (the big unlock).
 - **Layer 2e** — `JSContext` bridge: `eval_js({code})` against a running app.
 - **`describe_point`** — "what's under (x,y)?" for debugging gesture targets.

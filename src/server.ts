@@ -16,6 +16,7 @@ import { captureSnapshot, renderSnapshot, findInSnapshot, isActionable, type Ref
 import * as actions from "./actions.js";
 import { startLogStream, stopLogStream, tailLogs, clearLogs } from "./logs.js";
 import { DylibClient } from "./dylib_client.js";
+import { renderViewTree, type ViewTreeResult } from "./view_tree.js";
 
 const HID_KEYS: Record<string, number> = {
   RETURN: 40, ENTER: 40,
@@ -399,6 +400,68 @@ server.registerTool("dylib_info", {
     const client = await getDylibClient(bundle_id);
     const result = await client.call("info", {});
     return txt(JSON.stringify(result, null, 2));
+  } catch (e) { return err(e); }
+});
+
+server.registerTool("view_tree", {
+  description: "Walk the running app's UIView hierarchy on the main thread and return a compact text rendering. Strictly richer than snapshot: catches custom-drawn views, transient overlays, things SwiftUI synthesizes that AX flattens; reports actual class names (UIButton vs _UIRoundedRectButton), exact frames in window coords, alpha/hidden/userInteractionEnabled, and annotates which views are a UIViewController's root. Requires the dylib injected (launch_app({inject: true})). Filter the output via class_filter / ax_id_contains / text_contains to scope down before the model has to read it.",
+  inputSchema: {
+    bundle_id: z.string().optional(),
+    max_depth: z.number().int().positive().optional(),
+    max_nodes: z.number().int().positive().optional(),
+    include_invisible: z.boolean().optional(),
+    include_text: z.boolean().optional(),
+    show_frames: z.boolean().optional(),
+    class_filter: z.string().optional(),
+    ax_id_contains: z.string().optional(),
+    text_contains: z.string().optional(),
+    max_lines: z.number().int().positive().optional(),
+  },
+}, async ({ bundle_id, max_depth, max_nodes, include_invisible, include_text, show_frames, class_filter, ax_id_contains, text_contains, max_lines }) => {
+  try {
+    const client = await getDylibClient(bundle_id);
+    const tree = await client.call("view_tree", {
+      max_depth,
+      max_nodes,
+      include_invisible,
+      include_text,
+    }) as ViewTreeResult;
+    return txt(renderViewTree(tree, {
+      showFrames: show_frames ?? true,
+      classFilter: class_filter,
+      axIdContains: ax_id_contains,
+      textContains: text_contains,
+      maxLines: max_lines,
+    }));
+  } catch (e) { return err(e); }
+});
+
+server.registerTool("view_hit_test", {
+  description: "Ask the running app what view sits topmost at (x,y) in window coords, plus the full responder chain up to UIApplication. The right tool for 'tap at (201,406) isn't doing what I expect' — you see exactly which view receives the hit, whether it's userInteractionEnabled, and what view controllers are in the chain. Requires the dylib injected.",
+  inputSchema: {
+    x: z.number(),
+    y: z.number(),
+    bundle_id: z.string().optional(),
+  },
+}, async ({ x, y, bundle_id }) => {
+  try {
+    const client = await getDylibClient(bundle_id);
+    const result: any = await client.call("view_hit_test", { x, y });
+    if (result.hit === null) return txt(`no view at (${x},${y})`);
+    const h = result.hit;
+    const chainLines = (result.responder_chain ?? []).map((r: any, i: number) => {
+      const frame = r.frame ? ` (${Math.round(r.frame.x)},${Math.round(r.frame.y)} ${Math.round(r.frame.w)}x${Math.round(r.frame.h)})` : "";
+      const axId = r.ax_id ? ` #${r.ax_id}` : "";
+      const vcTag = r.is_vc ? " [VC]" : "";
+      return `  ${i === 0 ? "▶" : " "} ${r.class}${frame}${axId}${vcTag}`;
+    }).join("\n");
+    return txt(
+      `hit at (${x},${y}): ${h.class}\n` +
+      `  frame=${Math.round(h.frame.x)},${Math.round(h.frame.y)} ${Math.round(h.frame.w)}x${Math.round(h.frame.h)}\n` +
+      `  text=${JSON.stringify(h.text || "")}  ax_id=${JSON.stringify(h.ax_id || "")}  ax_label=${JSON.stringify(h.ax_label || "")}\n` +
+      `  interactive=${h.interactive}  alpha=${h.alpha}\n` +
+      `\nresponder chain:\n${chainLines}`,
+    );
   } catch (e) { return err(e); }
 });
 
