@@ -61,9 +61,14 @@ export class DylibClient {
       try { await this.openSocket(); return; }
       catch (e) { lastErr = e as Error; await sleep(80); }
     }
+    const tail = lastErr
+      ? `: ${lastErr.message}`
+      : `\nLikely causes:\n` +
+        `  1. App was not launched with inject:true (use launch_app({bundle_id, inject:true}))\n` +
+        `  2. App crashed before the dylib's socket constructor ran (check log_tail for ios-sim-mcp lifecycle line)\n` +
+        `  3. Dylib not built — run dylib/build.sh and relaunch`;
     throw new Error(
-      `Could not connect to dylib socket at ${this.socketPath} within ${this.connectTimeoutMs}ms` +
-      (lastErr ? `: ${lastErr.message}` : ` — was the app launched with inject: true?`),
+      `Could not connect to dylib socket at ${this.socketPath} within ${this.connectTimeoutMs}ms${tail}`,
     );
   }
 

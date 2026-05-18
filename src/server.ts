@@ -361,7 +361,11 @@ server.registerTool("launch_app", {
 async function getDylibClient(bundleId?: string): Promise<DylibClient> {
   const target = bundleId ?? state.lastInjectedBundleId;
   if (!target) {
-    throw new Error("No bundle_id given and no injected app on record. Call launch_app({bundle_id, inject: true}) first, or pass bundle_id explicitly.");
+    throw new Error(
+      "No bundle_id given and no app has been launched with inject:true this session.\n" +
+      "Either: pass bundle_id explicitly, or call launch_app({bundle_id, inject:true}) first.\n" +
+      "(Use dylib_health to check availability without throwing.)"
+    );
   }
   let client = state.dylibClients.get(target);
   if (client && !client.isConnected()) {
@@ -377,6 +381,13 @@ async function getDylibClient(bundleId?: string): Promise<DylibClient> {
   return client;
 }
 
+// Like getDylibClient but never throws — returns null when unavailable.
+// Used by dylib_health for graceful feature detection.
+async function tryGetDylibClient(bundleId?: string): Promise<DylibClient | null> {
+  try { return await getDylibClient(bundleId); }
+  catch { return null; }
+}
+
 server.registerTool("dylib_ping", {
   description: "Round-trip a ping to the Layer 2 dylib inside an injected app. Returns the response plus measured RTT in ms. Use this first to verify the dylib is loaded and reachable.",
   inputSchema: {
@@ -390,6 +401,30 @@ server.registerTool("dylib_ping", {
     const result = await client.call("ping", echo !== undefined ? { echo } : {});
     const rtt = Date.now() - t0;
     return txt(`pong from ${client.bundleId} (RTT ${rtt}ms)\n${JSON.stringify(result, null, 2)}`);
+  } catch (e) { return err(e); }
+});
+
+server.registerTool("dylib_health", {
+  description: "Lightweight liveness probe for the Layer 2 dylib. Returns {available, ...stats} when reachable, {available: false, reason} when not. Does NOT throw — safe to call as a feature-detection precheck before reaching for dylib-only tools. Stats include: bundle_id, pid, uptime_s, phase, whether network capture is running, record/stub counts, JS context status, method count.",
+  inputSchema: { bundle_id: z.string().optional() },
+}, async ({ bundle_id }) => {
+  try {
+    const client = await tryGetDylibClient(bundle_id);
+    if (!client) {
+      return txt(JSON.stringify({
+        available: false,
+        reason: "no app launched with inject:true this session, or socket not yet bound",
+      }, null, 2));
+    }
+    try {
+      const r: any = await client.call("dylib_health", {}, { timeoutMs: 2000 });
+      return txt(JSON.stringify({ available: true, ...r }, null, 2));
+    } catch (callErr) {
+      return txt(JSON.stringify({
+        available: false,
+        reason: callErr instanceof Error ? callErr.message : String(callErr),
+      }, null, 2));
+    }
   } catch (e) { return err(e); }
 });
 

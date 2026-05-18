@@ -20,6 +20,8 @@ MCP server for driving the iOS Simulator the way Chrome MCP drives a browser: se
 - **2d** `URLProtocol`-based network interception with bodies (the big unlock).
 - **2e** `JSContext` eval bridge.
 
+**Productionization (v0.4.0):** universal dylib via lipo (arm64 + x86_64). Crash-safety pass: `@try` added around `ism_accept_loop`'s dispatch_async block, `ism_install_network_swizzles`, stub-synthesis dispatch_after block, all three `ISMURLProtocol` delegate methods (`didReceiveResponse`, `didReceiveData`, `didCompleteWithError`). Accept loop survives transient `accept()` failures with 250ms backoff instead of exiting. Added `dylib_health` method + `dylib_health` MCP tool — never throws, returns `{available, ...stats}` for graceful feature detection. `tryGetDylibClient` helper in server.ts wraps `getDylibClient` for non-throwing path. Improved not-injected error messages (numbered diagnostic list pointing at common causes).
+
 **Layer 2 safety invariants (don't regress):**
 - Constructor blocks dyld — must return ASAP. Accept loop runs on a separate dispatch queue.
 - `SIGPIPE` is ignored globally + `SO_NOSIGPIPE` per-fd. Writing to a closed socket would otherwise kill the host app.

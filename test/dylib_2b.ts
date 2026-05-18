@@ -41,7 +41,7 @@ async function main() {
   const info = await call("dylib_info", {});
   expect(!info.isError, "info succeeded");
   expect(/"bundle_id":\s*"com\.apple\.Preferences"/.test(info.text), "info reports bundle_id");
-  expect(/"phase":\s*"2b"/.test(info.text), "info reports phase 2b");
+  expect(/"phase":\s*"2[a-z]"/.test(info.text), "info reports a Layer-2 phase tag");
   expect(/"methods":\s*\[/.test(info.text), "info reports methods array");
 
   // Round 3: generic dylib_call to an unknown method, expect a graceful error w/ available list

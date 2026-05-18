@@ -34,8 +34,7 @@ build_slice() {
 }
 
 build_slice arm64
-# x86_64 build is optional; uncomment if you need Intel-sim support.
-# build_slice x86_64
+build_slice x86_64
 
 # If both slices built, lipo into a universal binary; otherwise just rename.
 if [ -f "$OUT_DIR/${OUT_NAME}.x86_64" ]; then

@@ -199,13 +199,21 @@ static void ism_accept_loop(void) {
         int conn = accept(ism_listen_fd, NULL, NULL);
         if (conn < 0) {
             if (errno == EINTR) continue;
-            os_log_error(ism_log(), "accept() failed: errno=%d", errno);
-            break;
+            // Transient errors shouldn't kill the loop — log and back off briefly.
+            os_log_error(ism_log(), "accept() failed: errno=%d, retrying in 250ms", errno);
+            usleep(250 * 1000);
+            continue;
         }
         int yes = 1;
         setsockopt(conn, SOL_SOCKET, SO_NOSIGPIPE, &yes, sizeof(yes));
         dispatch_async(conn_queue, ^{
-            @autoreleasepool { ism_serve_connection(conn); }
+            @try {
+                @autoreleasepool { ism_serve_connection(conn); }
+            } @catch (NSException *e) {
+                os_log_error(ism_log(), "serve_connection threw: %{public}@ — closing fd",
+                             e.reason ?: e.name);
+                close(conn);
+            }
         });
     }
 }
@@ -788,15 +796,24 @@ static void ism_net_record_completed(int64_t recordId, NSURLResponse *response, 
                        dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
             typeof(self) s = weakSelf;
             if (!s) return;
-            NSHTTPURLResponse *response = [[NSHTTPURLResponse alloc] initWithURL:s.request.URL
-                                                                       statusCode:status
-                                                                      HTTPVersion:@"HTTP/1.1"
-                                                                     headerFields:headers];
-            s->_responseStartedAt = [NSDate date];
-            [s.client URLProtocol:s didReceiveResponse:response cacheStoragePolicy:NSURLCacheStorageNotAllowed];
-            if (body.length > 0) [s.client URLProtocol:s didLoadData:body];
-            ism_net_record_completed(s->_recordId, response, body, s->_startedAt, s->_responseStartedAt, nil);
-            [s.client URLProtocolDidFinishLoading:s];
+            @try {
+                NSHTTPURLResponse *response = [[NSHTTPURLResponse alloc] initWithURL:s.request.URL
+                                                                           statusCode:status
+                                                                          HTTPVersion:@"HTTP/1.1"
+                                                                         headerFields:headers];
+                s->_responseStartedAt = [NSDate date];
+                [s.client URLProtocol:s didReceiveResponse:response cacheStoragePolicy:NSURLCacheStorageNotAllowed];
+                if (body.length > 0) [s.client URLProtocol:s didLoadData:body];
+                ism_net_record_completed(s->_recordId, response, body, s->_startedAt, s->_responseStartedAt, nil);
+                [s.client URLProtocolDidFinishLoading:s];
+            } @catch (NSException *e) {
+                os_log_error(ism_rpc_log(), "stub synthesis threw: %{public}@", e.reason ?: e.name);
+                @try { [s.client URLProtocol:s didFailWithError:
+                    [NSError errorWithDomain:@"ios-sim-mcp"
+                                        code:-1
+                                    userInfo:@{NSLocalizedDescriptionKey: e.reason ?: @"stub error"}]]; }
+                @catch (__unused NSException *e2) {}
+            }
         });
         return;
     }
@@ -835,24 +852,40 @@ static void ism_net_record_completed(int64_t recordId, NSURLResponse *response, 
           dataTask:(NSURLSessionDataTask *)dataTask
 didReceiveResponse:(NSURLResponse *)response
  completionHandler:(void (^)(NSURLSessionResponseDisposition))completionHandler {
-    _responseStartedAt = [NSDate date];
-    [self.client URLProtocol:self didReceiveResponse:response cacheStoragePolicy:NSURLCacheStorageNotAllowed];
+    @try {
+        _responseStartedAt = [NSDate date];
+        [self.client URLProtocol:self didReceiveResponse:response cacheStoragePolicy:NSURLCacheStorageNotAllowed];
+    } @catch (NSException *e) {
+        os_log_error(ism_rpc_log(), "didReceiveResponse threw: %{public}@", e.reason ?: e.name);
+    }
     completionHandler(NSURLSessionResponseAllow);
 }
 
 - (void)URLSession:(NSURLSession *)session
           dataTask:(NSURLSessionDataTask *)dataTask
     didReceiveData:(NSData *)data {
-    [_responseData appendData:data];
-    [self.client URLProtocol:self didLoadData:data];
+    @try {
+        [_responseData appendData:data];
+        [self.client URLProtocol:self didLoadData:data];
+    } @catch (NSException *e) {
+        os_log_error(ism_rpc_log(), "didReceiveData threw: %{public}@", e.reason ?: e.name);
+    }
 }
 
 - (void)URLSession:(NSURLSession *)session
               task:(NSURLSessionTask *)task
 didCompleteWithError:(NSError *)error {
-    ism_net_record_completed(_recordId, task.response, _responseData, _startedAt, _responseStartedAt, error);
-    if (error) [self.client URLProtocol:self didFailWithError:error];
-    else       [self.client URLProtocolDidFinishLoading:self];
+    @try {
+        ism_net_record_completed(_recordId, task.response, _responseData, _startedAt, _responseStartedAt, error);
+    } @catch (NSException *e) {
+        os_log_error(ism_rpc_log(), "record_completed threw: %{public}@", e.reason ?: e.name);
+    }
+    @try {
+        if (error) [self.client URLProtocol:self didFailWithError:error];
+        else       [self.client URLProtocolDidFinishLoading:self];
+    } @catch (NSException *e) {
+        os_log_error(ism_rpc_log(), "URLProtocol completion forward threw: %{public}@", e.reason ?: e.name);
+    }
 }
 
 @end
@@ -881,15 +914,19 @@ static NSURLSessionConfiguration *ism_swizzled_ephemeral(Class self, SEL _cmd) {
 
 static void ism_install_network_swizzles(void) {
     if (ism_orig_defaultConfig_imp) return; // already installed
-    Method m1 = class_getClassMethod([NSURLSessionConfiguration class], @selector(defaultSessionConfiguration));
-    if (m1) {
-        ism_orig_defaultConfig_imp = method_getImplementation(m1);
-        method_setImplementation(m1, (IMP)ism_swizzled_default);
-    }
-    Method m2 = class_getClassMethod([NSURLSessionConfiguration class], @selector(ephemeralSessionConfiguration));
-    if (m2) {
-        ism_orig_ephemeralConfig_imp = method_getImplementation(m2);
-        method_setImplementation(m2, (IMP)ism_swizzled_ephemeral);
+    @try {
+        Method m1 = class_getClassMethod([NSURLSessionConfiguration class], @selector(defaultSessionConfiguration));
+        if (m1) {
+            ism_orig_defaultConfig_imp = method_getImplementation(m1);
+            method_setImplementation(m1, (IMP)ism_swizzled_default);
+        }
+        Method m2 = class_getClassMethod([NSURLSessionConfiguration class], @selector(ephemeralSessionConfiguration));
+        if (m2) {
+            ism_orig_ephemeralConfig_imp = method_getImplementation(m2);
+            method_setImplementation(m2, (IMP)ism_swizzled_ephemeral);
+        }
+    } @catch (NSException *e) {
+        os_log_error(ism_log(), "swizzle install failed: %{public}@", e.reason ?: e.name);
     }
 }
 
@@ -1025,8 +1062,38 @@ static void ism_register_builtins(NSString *bundleId, NSString *processName, NSS
             @"bundle_id": bundleId ?: @"",
             @"bundle_path": bundlePath ?: @"",
             @"uptime_s": @([[NSDate date] timeIntervalSinceDate:startedAt]),
-            @"phase": @"2b",
+            @"phase": @"2f",
             @"methods": ism_method_names(),
+        };
+    });
+
+    // dylib_health: lightweight liveness probe — single call returns whether
+    // the dylib is responsive and basic stats. Designed so callers can feature-
+    // detect without paying for a full info() (which is also fine, this is just
+    // smaller). Always succeeds; never throws.
+    ism_register_method(@"dylib_health", ^NSDictionary *(NSDictionary *params) {
+        NSUInteger netRecCount = 0, stubCount = 0;
+        if (ism_net_lock) {
+            [ism_net_lock lock];
+            netRecCount = ism_net_records.count;
+            [ism_net_lock unlock];
+        }
+        if (ism_net_stubs_lock) {
+            [ism_net_stubs_lock lock];
+            stubCount = ism_net_stubs.count;
+            [ism_net_stubs_lock unlock];
+        }
+        return @{
+            @"ok": @YES,
+            @"bundle_id": bundleId ?: @"",
+            @"pid": @(pid),
+            @"uptime_s": @([[NSDate date] timeIntervalSinceDate:startedAt]),
+            @"phase": @"2f",
+            @"net_capture_running": @(ism_net_running),
+            @"net_records_held": @(netRecCount),
+            @"net_stubs_registered": @(stubCount),
+            @"js_context_active": @(ism_js_ctx != nil),
+            @"methods_count": @(ism_method_names().count),
         };
     });
 

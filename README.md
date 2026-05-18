@@ -49,7 +49,7 @@ claude mcp add -s user ios-sim -- npx -y ios-sim-mcp
 claude mcp list | grep ios-sim     # ios-sim: ... ✓ Connected
 ```
 
-Layer 2 dylib comes prebuilt for Apple Silicon. If you're on Intel Mac or want to rebuild, `cd $(npm root -g)/ios-sim-mcp && ./dylib/build.sh`.
+Layer 2 dylib ships prebuilt as a universal binary (arm64 + x86_64) — works on both Apple Silicon and Intel Macs out of the box.
 
 ### From source
 
@@ -332,6 +332,24 @@ Bridged globals (all installed automatically on first `eval_js`):
 | `log(msg)` | → void | writes to os_log (visible via `log_tail`) |
 
 JSC's `JSExport` is implemented on UIView, UIWindow, UIViewController, UILabel, UIButton, UITextField, UITextView, UIApplication, NSBundle, NSProcessInfo, NSUserDefaults, UIPasteboard so common property access and method calls work without further bridging. Selector colons become camelCase function names: `setObject:forKey:` → `setObjectForKey(value, key)`.
+
+## Safety & production posture
+
+The Layer 2 dylib is engineered to **never crash the host app**:
+
+- `SIGPIPE` is ignored globally and `SO_NOSIGPIPE` set per-fd, so a closed MCP-side socket cannot kill the host process.
+- Every dispatched task (accept loop, per-connection serve, URLSession delegate callbacks, stub synthesis, view walks, JS eval) is wrapped in `@try` and logs via `os_log` on catch rather than propagating.
+- The accept loop survives transient `accept()` failures with a 250ms backoff instead of exiting.
+- Method handlers run on a background queue; UIKit-touching ones bounce to main via `dispatch_sync` with caller-controllable timeouts.
+- Buffers are bounded: 5,000 log lines, 500 network records (configurable), 256KB body cap (configurable).
+- All shared state is `NSLock`-protected.
+
+**This is a dev/test tool, not for production builds.** Two safety invariants make it appropriate only for engineering simulators:
+
+1. **No App Store risk** — `DYLD_INSERT_LIBRARIES` is a *runtime* injection via `SIMCTL_CHILD_*` env vars. The dylib is never linked, embedded, or shipped with your app binary. App Store builds physically cannot load it.
+2. **Opt-in per launch** — `launch_app` defaults to `inject: false`. The dylib only loads when you explicitly pass `inject: true`, and only in the simulator (Apple's hardened-runtime + code-signing requirements prevent DYLD injection into real-device or production builds).
+
+If you accidentally call a dylib-only tool (`view_tree`, `eval_js`, `network_*`, etc.) without `inject: true`, you get an actionable error pointing at the fix — never a hang or a crash. Use `dylib_health` for non-throwing feature detection in scripts.
 
 ## Roadmap
 
