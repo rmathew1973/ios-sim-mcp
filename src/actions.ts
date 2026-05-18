@@ -1,6 +1,22 @@
+import { spawn } from "node:child_process";
 import { runIdb } from "./idb.js";
 import { state } from "./state.js";
 import { captureSnapshot, snapshotIsDegenerate } from "./snapshot.js";
+
+function runCmd(cmd: string, args: string[], env: NodeJS.ProcessEnv = process.env): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const child = spawn(cmd, args, { stdio: ["ignore", "pipe", "pipe"], env });
+    let stdout = "";
+    let stderr = "";
+    child.stdout.on("data", (b) => (stdout += b.toString()));
+    child.stderr.on("data", (b) => (stderr += b.toString()));
+    child.on("error", (err) => reject(new Error(`${cmd}: ${err.message}`)));
+    child.on("close", (code) => {
+      if (code === 0) resolve(stdout);
+      else reject(new Error(`${cmd} ${args.join(" ")} exited ${code}: ${stderr.trim() || stdout.trim()}`));
+    });
+  });
+}
 
 function invalidate() {
   state.lastSnapshot = null;
@@ -52,8 +68,23 @@ export async function pressButton(udid: string, name: string): Promise<void> {
   invalidate();
 }
 
-export async function launchApp(udid: string, bundleId: string, args: string[] = []): Promise<void> {
-  await runIdb(["launch", "--udid", udid, bundleId, ...args]);
+export interface LaunchOpts {
+  args?: string[];
+  injectDylib?: string;
+  terminateRunning?: boolean;
+}
+
+export async function launchApp(udid: string, bundleId: string, opts: LaunchOpts = {}): Promise<void> {
+  if (opts.injectDylib) {
+    // Bypass idb: simctl is the documented path for SIMCTL_CHILD_* env passthrough.
+    const env = { ...process.env, SIMCTL_CHILD_DYLD_INSERT_LIBRARIES: opts.injectDylib };
+    const args = ["simctl", "launch"];
+    if (opts.terminateRunning) args.push("--terminate-running-process");
+    args.push(udid, bundleId, ...(opts.args ?? []));
+    await runCmd("xcrun", args, env);
+  } else {
+    await runIdb(["launch", "--udid", udid, bundleId, ...(opts.args ?? [])]);
+  }
   invalidate();
 }
 

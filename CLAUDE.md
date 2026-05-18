@@ -6,7 +6,14 @@ MCP server for driving the iOS Simulator the way Chrome MCP drives a browser: se
 
 **Layer 1 (current, shipping):** wraps `idb` (Facebook's iOS Device Bridge — talks to CoreSimulator's private framework, no WebDriverAgent bridge). Each call is ~100ms.
 
-**Layer 2 (planned, not built):** `DYLD_INSERT_LIBRARIES` dylib injected at app launch. Opens a Unix socket exposing live `UIView` hierarchy, JavaScriptCore eval against running app state, `URLProtocol`-based network interception with bodies, and structured event streams. Opt-in per app via env var.
+**Layer 2 (in progress):** `DYLD_INSERT_LIBRARIES` dylib injected at app launch via `SIMCTL_CHILD_DYLD_INSERT_LIBRARIES` (passed to `xcrun simctl launch` — idb's launch path doesn't forward env). Opt-in per launch (`launch_app({inject: true})`).
+- **2a ✅** Proof-of-life — constructor runs, emits `os_log` lifecycle line. See [dylib/ios_sim_mcp_dylib.m](dylib/ios_sim_mcp_dylib.m) + [dylib/build.sh](dylib/build.sh). Subsystem: `com.hmbsoftware.ios-sim-mcp`, category: `lifecycle`. Smoke-tested via [test/inject.ts](test/inject.ts).
+- **2b** Unix socket + JSON-Lines RPC (not built).
+- **2c** `view_tree` walking `UIApplication.windows` → root VCs → views.
+- **2d** `URLProtocol`-based network interception with bodies (the big unlock).
+- **2e** `JSContext` eval bridge.
+
+Dylib is iOS-Simulator-flavored (`LC_BUILD_VERSION` platform 7, iOS 14+). Build: `./dylib/build.sh`. Output: `dylib/build/libios-sim-mcp.dylib` (arm64 only by default; x86_64 slice commented out). Default path resolved in server.ts as `path.resolve(__dirname, "../dylib/build/libios-sim-mcp.dylib")`.
 
 **Layer 3 (current, shipping):** `xcrun simctl spawn <udid> log stream` piped into an in-memory ring buffer.
 

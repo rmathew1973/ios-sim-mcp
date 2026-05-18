@@ -36,3 +36,6 @@ report.[0-9]_.[0-9]_.[0-9]_.[0-9]_.json
 # project-specific
 /tmp/
 ios-sim-*.png
+
+# Built dylib artifacts (rebuilt via dylib/build.sh)
+dylib/build/

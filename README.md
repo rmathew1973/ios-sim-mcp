@@ -17,7 +17,8 @@ Three layers, two shipping today:
 | Layer | Status | Tech | What it gives you |
 |-------|--------|------|-------------------|
 | 1 — AX tree + actions | ✅ shipping | `idb` (Facebook's CoreSimulator bridge) | snapshot, find, tap, type, swipe, scroll, launch, screenshot — all ~100ms |
-| 2 — In-process introspection | 🚧 planned | `DYLD_INSERT_LIBRARIES` dylib | live `UIView` hierarchy, JavaScriptCore eval, `URLProtocol` network interception, structured events |
+| 2a — Dylib proof-of-life | ✅ shipping | `DYLD_INSERT_LIBRARIES` via `SIMCTL_CHILD_*` | constructor runs in the target app before `main()`; logs lifecycle via `os_log` |
+| 2b–2e — In-process introspection | 🚧 next | Unix socket + Obj-C runtime | live `UIView` hierarchy, JavaScriptCore eval, `URLProtocol` network interception, structured events |
 | 3 — System logs | ✅ shipping | `xcrun simctl spawn log stream` | streaming os_log into a 5000-line ring buffer |
 
 `idb` talks directly to CoreSimulator's private framework — no WebDriverAgent, no HTTP hop into the simulator process — which is why the per-call latency is closer to a local subprocess than to a network round trip.
@@ -144,9 +145,26 @@ Button("Sign In") { ... }
 
 Then `tap({id: "login_submit_button"})` is O(1) and survives label changes, localization, and layout shifts.
 
+## Layer 2 dylib (optional, opt-in per launch)
+
+`launch_app({bundle_id, inject: true})` loads a small dylib into the target app via `SIMCTL_CHILD_DYLD_INSERT_LIBRARIES`. As of Phase 2a, the dylib just emits a lifecycle line you can observe via `log_tail` — but the injection plumbing is what unlocks the rest of Layer 2 (in-process view hierarchy, JS eval, network interception). Future phases will add these without changing the launch surface.
+
+Build it once:
+
+```bash
+./dylib/build.sh         # outputs dylib/build/libios-sim-mcp.dylib
+```
+
+Then any `launch_app` call with `inject: true` will load it. Override the path with `inject_dylib: "/custom/path.dylib"`.
+
+The dylib is iOS-Simulator-flavored (`LC_BUILD_VERSION` platform 7, iOS 14+) and only loads in apps you launch through this tool. It does not modify the app on disk and leaves no trace after the process exits.
+
 ## Roadmap
 
-- **Layer 2 dylib** — `DYLD_INSERT_LIBRARIES` payload exposing live view hierarchy, JS eval, and a `URLProtocol`-based network interceptor over a Unix socket. The network piece alone is the big unlock: see exactly what URLs the app is hitting, with bodies, in real time.
+- **Layer 2b** — Unix socket server in the dylib, JSON-Lines RPC.
+- **Layer 2c** — `view_tree` handler that walks `UIApplication.windows` → root VCs → views.
+- **Layer 2d** — `URLProtocol` interceptor for network bodies (the big unlock).
+- **Layer 2e** — `JSContext` bridge: `eval_js({code})` against a running app.
 - **`describe_point`** — "what's under (x,y)?" for debugging gesture targets.
 - **Video recording** — wrap `idb record-video` as `record_start`/`record_stop`.
 - **Multi-sim parallelism** — share one server across multiple booted devices for matrix testing.

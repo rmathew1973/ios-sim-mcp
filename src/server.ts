@@ -5,6 +5,10 @@ import { z } from "zod";
 import { promises as fs } from "node:fs";
 import * as path from "node:path";
 import * as os from "node:os";
+import { fileURLToPath } from "node:url";
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const DEFAULT_DYLIB_PATH = path.resolve(__dirname, "../dylib/build/libios-sim-mcp.dylib");
 
 import { bootedSimulators, listTargets } from "./idb.js";
 import { state, requireUdid } from "./state.js";
@@ -267,16 +271,28 @@ server.registerTool("scroll", {
 });
 
 server.registerTool("launch_app", {
-  description: "Launch an app by bundle id (com.example.App). Optional foreground_if_running terminates first.",
-  inputSchema: { bundle_id: z.string(), foreground_if_running: z.boolean().optional() },
-}, async ({ bundle_id, foreground_if_running }) => {
+  description: "Launch an app by bundle id (com.example.App). 'foreground_if_running' terminates first. 'inject' loads the Layer 2 dylib (default path: dylib/build/libios-sim-mcp.dylib relative to the server) via SIMCTL_CHILD_DYLD_INSERT_LIBRARIES — currently just emits a lifecycle log line; future phases add a Unix socket. 'inject_dylib' overrides the dylib path. Inject requires the dylib to be built (run dylib/build.sh).",
+  inputSchema: {
+    bundle_id: z.string(),
+    foreground_if_running: z.boolean().optional(),
+    inject: z.boolean().optional(),
+    inject_dylib: z.string().optional(),
+  },
+}, async ({ bundle_id, foreground_if_running, inject, inject_dylib }) => {
   try {
     const udid = await ensureUdid();
     if (foreground_if_running) {
       try { await actions.terminateApp(udid, bundle_id); } catch {}
     }
-    await actions.launchApp(udid, bundle_id);
-    return txt(`launched ${bundle_id}`);
+    let dylib: string | undefined;
+    if (inject_dylib) dylib = inject_dylib;
+    else if (inject) dylib = DEFAULT_DYLIB_PATH;
+    if (dylib) {
+      try { await fs.access(dylib); }
+      catch { throw new Error(`Dylib not found at ${dylib}. Run dylib/build.sh first.`); }
+    }
+    await actions.launchApp(udid, bundle_id, { injectDylib: dylib, terminateRunning: foreground_if_running });
+    return txt(`launched ${bundle_id}${dylib ? ` (injected ${path.basename(dylib)})` : ""}`);
   } catch (e) { return err(e); }
 });
 
