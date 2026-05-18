@@ -1,0 +1,20 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.rmathew1973/ios-sim-mcp",
+  "description": "MCP server that drives the iOS Simulator via semantic accessibility-tree snapshots with stable refs. Sub-200ms ops, no WebDriverAgent, no screenshot loops. Includes an injectable dylib for in-process view introspection, HTTP capture/stubbing, JavaScript eval, and byte-perfect text input.",
+  "repository": {
+    "url": "https://github.com/rmathew1973/ios-sim-mcp",
+    "source": "github"
+  },
+  "version": "0.4.2",
+  "packages": [
+    {
+      "registryType": "npm",
+      "identifier": "ios-sim-mcp",
+      "version": "0.4.2",
+      "transport": {
+        "type": "stdio"
+      }
+    }
+  ]
+}
