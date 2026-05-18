@@ -15,6 +15,7 @@ import { state, requireUdid } from "./state.js";
 import { captureSnapshot, renderSnapshot, findInSnapshot, isActionable, type RefEntry } from "./snapshot.js";
 import * as actions from "./actions.js";
 import { startLogStream, stopLogStream, tailLogs, clearLogs } from "./logs.js";
+import { DylibClient } from "./dylib_client.js";
 
 const HID_KEYS: Record<string, number> = {
   RETURN: 40, ENTER: 40,
@@ -292,7 +293,78 @@ server.registerTool("launch_app", {
       catch { throw new Error(`Dylib not found at ${dylib}. Run dylib/build.sh first.`); }
     }
     await actions.launchApp(udid, bundle_id, { injectDylib: dylib, terminateRunning: foreground_if_running });
+    if (dylib) {
+      state.lastInjectedBundleId = bundle_id;
+      // If we already had a client for this bundle, close it so the next
+      // dylib_* call reconnects to the freshly-spawned process.
+      const stale = state.dylibClients.get(bundle_id);
+      if (stale) { stale.close(); state.dylibClients.delete(bundle_id); }
+    }
     return txt(`launched ${bundle_id}${dylib ? ` (injected ${path.basename(dylib)})` : ""}`);
+  } catch (e) { return err(e); }
+});
+
+// -------- Layer 2 dylib RPC --------
+
+async function getDylibClient(bundleId?: string): Promise<DylibClient> {
+  const target = bundleId ?? state.lastInjectedBundleId;
+  if (!target) {
+    throw new Error("No bundle_id given and no injected app on record. Call launch_app({bundle_id, inject: true}) first, or pass bundle_id explicitly.");
+  }
+  let client = state.dylibClients.get(target);
+  if (client && !client.isConnected()) {
+    client.close();
+    state.dylibClients.delete(target);
+    client = undefined;
+  }
+  if (!client) {
+    client = new DylibClient({ bundleId: target });
+    await client.connect();
+    state.dylibClients.set(target, client);
+  }
+  return client;
+}
+
+server.registerTool("dylib_ping", {
+  description: "Round-trip a ping to the Layer 2 dylib inside an injected app. Returns the response plus measured RTT in ms. Use this first to verify the dylib is loaded and reachable.",
+  inputSchema: {
+    bundle_id: z.string().optional(),
+    echo: z.string().optional(),
+  },
+}, async ({ bundle_id, echo }) => {
+  try {
+    const client = await getDylibClient(bundle_id);
+    const t0 = Date.now();
+    const result = await client.call("ping", echo !== undefined ? { echo } : {});
+    const rtt = Date.now() - t0;
+    return txt(`pong from ${client.bundleId} (RTT ${rtt}ms)\n${JSON.stringify(result, null, 2)}`);
+  } catch (e) { return err(e); }
+});
+
+server.registerTool("dylib_info", {
+  description: "Ask the Layer 2 dylib to describe its host process: pid, bundle id, process name, bundle path, uptime, and the list of RPC methods it exposes.",
+  inputSchema: { bundle_id: z.string().optional() },
+}, async ({ bundle_id }) => {
+  try {
+    const client = await getDylibClient(bundle_id);
+    const result = await client.call("info", {});
+    return txt(JSON.stringify(result, null, 2));
+  } catch (e) { return err(e); }
+});
+
+server.registerTool("dylib_call", {
+  description: "Generic escape hatch: invoke an arbitrary method on the Layer 2 dylib. Use dylib_info first to see available methods. Passes 'params' through verbatim. Future phases (2c view_tree, 2d network_*, 2e eval_js) add methods this can reach.",
+  inputSchema: {
+    method: z.string(),
+    params: z.record(z.any()).optional(),
+    bundle_id: z.string().optional(),
+    timeout_ms: z.number().int().positive().optional(),
+  },
+}, async ({ method, params, bundle_id, timeout_ms }) => {
+  try {
+    const client = await getDylibClient(bundle_id);
+    const result = await client.call(method, params ?? {}, { timeoutMs: timeout_ms });
+    return txt(JSON.stringify(result, null, 2));
   } catch (e) { return err(e); }
 });
 

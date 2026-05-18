@@ -18,7 +18,8 @@ Three layers, two shipping today:
 |-------|--------|------|-------------------|
 | 1 — AX tree + actions | ✅ shipping | `idb` (Facebook's CoreSimulator bridge) | snapshot, find, tap, type, swipe, scroll, launch, screenshot — all ~100ms |
 | 2a — Dylib proof-of-life | ✅ shipping | `DYLD_INSERT_LIBRARIES` via `SIMCTL_CHILD_*` | constructor runs in the target app before `main()`; logs lifecycle via `os_log` |
-| 2b–2e — In-process introspection | 🚧 next | Unix socket + Obj-C runtime | live `UIView` hierarchy, JavaScriptCore eval, `URLProtocol` network interception, structured events |
+| 2b — In-process RPC | ✅ shipping | Unix socket + JSON-Lines | round-trip into a running app at **~1ms per call**; `dylib_ping` / `dylib_info` / `dylib_call` |
+| 2c–2e — Introspection | 🚧 next | Obj-C runtime | live `UIView` hierarchy, JavaScriptCore eval, `URLProtocol` network interception |
 | 3 — System logs | ✅ shipping | `xcrun simctl spawn log stream` | streaming os_log into a 5000-line ring buffer |
 
 `idb` talks directly to CoreSimulator's private framework — no WebDriverAgent, no HTTP hop into the simulator process — which is why the per-call latency is closer to a local subprocess than to a network round trip.
@@ -147,7 +148,15 @@ Then `tap({id: "login_submit_button"})` is O(1) and survives label changes, loca
 
 ## Layer 2 dylib (optional, opt-in per launch)
 
-`launch_app({bundle_id, inject: true})` loads a small dylib into the target app via `SIMCTL_CHILD_DYLD_INSERT_LIBRARIES`. As of Phase 2a, the dylib just emits a lifecycle line you can observe via `log_tail` — but the injection plumbing is what unlocks the rest of Layer 2 (in-process view hierarchy, JS eval, network interception). Future phases will add these without changing the launch surface.
+`launch_app({bundle_id, inject: true})` loads a small dylib into the target app via `SIMCTL_CHILD_DYLD_INSERT_LIBRARIES`. The dylib opens a Unix socket at `/tmp/ios-sim-mcp-<bundle-id>.sock` and serves JSON-Lines RPC. You can then talk into the running app:
+
+```ts
+dylib_ping({ echo: "hi" })          // pong from com.apple.Preferences (RTT 1ms)
+dylib_info({})                       // {pid, bundle_id, process_name, bundle_path, methods, ...}
+dylib_call({ method: "...", params }) // generic; future phases register more methods
+```
+
+Once connected, IPC is **sub-millisecond per call** — orders of magnitude cheaper than Layer 1's subprocess-spawn overhead. Connection is lazy (first `dylib_*` call) and pooled per bundle id; relaunch invalidates the old client automatically.
 
 Build it once:
 
@@ -155,13 +164,10 @@ Build it once:
 ./dylib/build.sh         # outputs dylib/build/libios-sim-mcp.dylib
 ```
 
-Then any `launch_app` call with `inject: true` will load it. Override the path with `inject_dylib: "/custom/path.dylib"`.
-
-The dylib is iOS-Simulator-flavored (`LC_BUILD_VERSION` platform 7, iOS 14+) and only loads in apps you launch through this tool. It does not modify the app on disk and leaves no trace after the process exits.
+The dylib is iOS-Simulator-flavored (`LC_BUILD_VERSION` platform 7, iOS 14+), only loads in apps you launch through this tool with `inject: true`, does not modify the app on disk, and leaves no trace after the process exits.
 
 ## Roadmap
 
-- **Layer 2b** — Unix socket server in the dylib, JSON-Lines RPC.
 - **Layer 2c** — `view_tree` handler that walks `UIApplication.windows` → root VCs → views.
 - **Layer 2d** — `URLProtocol` interceptor for network bodies (the big unlock).
 - **Layer 2e** — `JSContext` bridge: `eval_js({code})` against a running app.

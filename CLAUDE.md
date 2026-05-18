@@ -8,10 +8,18 @@ MCP server for driving the iOS Simulator the way Chrome MCP drives a browser: se
 
 **Layer 2 (in progress):** `DYLD_INSERT_LIBRARIES` dylib injected at app launch via `SIMCTL_CHILD_DYLD_INSERT_LIBRARIES` (passed to `xcrun simctl launch` — idb's launch path doesn't forward env). Opt-in per launch (`launch_app({inject: true})`).
 - **2a ✅** Proof-of-life — constructor runs, emits `os_log` lifecycle line. See [dylib/ios_sim_mcp_dylib.m](dylib/ios_sim_mcp_dylib.m) + [dylib/build.sh](dylib/build.sh). Subsystem: `com.hmbsoftware.ios-sim-mcp`, category: `lifecycle`. Smoke-tested via [test/inject.ts](test/inject.ts).
-- **2b** Unix socket + JSON-Lines RPC (not built).
+- **2b ✅** Unix socket + JSON-Lines RPC. Socket at `/tmp/ios-sim-mcp-<sanitized-bundle-id>.sock`, perms 0600. Per-connection serial read loop on a concurrent dispatch queue. Methods registered via `ism_register_method` (currently `ping`, `info`). MCP side: [src/dylib_client.ts](src/dylib_client.ts) with line-buffered protocol, pending-call map, lazy connect with 4s deadline, auto-reconnect after relaunch. Tools: `dylib_ping`, `dylib_info`, `dylib_call`. Measured: ~1ms per call once connected, 822ms cold first call (mostly socket-existence wait after launch). Smoke-tested via [test/dylib_2b.ts](test/dylib_2b.ts).
 - **2c** `view_tree` walking `UIApplication.windows` → root VCs → views.
 - **2d** `URLProtocol`-based network interception with bodies (the big unlock).
 - **2e** `JSContext` eval bridge.
+
+**Layer 2 safety invariants (don't regress):**
+- Constructor blocks dyld — must return ASAP. Accept loop runs on a separate dispatch queue.
+- `SIGPIPE` is ignored globally + `SO_NOSIGPIPE` per-fd. Writing to a closed socket would otherwise kill the host app.
+- All dispatch_async handlers wrap work in `@try` and `@autoreleasepool`.
+- Method handlers run on a background queue. Any future UIKit access must `dispatch_sync(dispatch_get_main_queue(), …)`.
+- Stale sockets from previous launches are `unlink()`'d before bind.
+- Dylib does nothing if `[NSBundle mainBundle].bundleIdentifier` is empty (likely a helper/extension process — don't try to bind a socket for it).
 
 Dylib is iOS-Simulator-flavored (`LC_BUILD_VERSION` platform 7, iOS 14+). Build: `./dylib/build.sh`. Output: `dylib/build/libios-sim-mcp.dylib` (arm64 only by default; x86_64 slice commented out). Default path resolved in server.ts as `path.resolve(__dirname, "../dylib/build/libios-sim-mcp.dylib")`.
 
