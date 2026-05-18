@@ -1275,6 +1275,80 @@ static void ism_register_builtins(NSString *bundleId, NSString *processName, NSS
         return @{@"cleared": @YES};
     });
 
+    // -------- View text convenience helpers --------
+
+    // view_get_text: lookup a view by ax_id or class, return text content via
+    // the existing ism_view_text_content rules (UILabel.text / UIButton.title
+    // / UITextField.text / UITextView.text). Falls back to ax_label / ax_value
+    // when the view itself has no rendered text. The right tool for "what
+    // does the OK button currently say?" or "what's in the email field?".
+    ism_register_method(@"view_get_text", ^NSDictionary *(NSDictionary *params) {
+        NSString *axId  = [params[@"ax_id"]  isKindOfClass:[NSString class]] ? params[@"ax_id"]  : nil;
+        NSString *cls   = [params[@"class"]  isKindOfClass:[NSString class]] ? params[@"class"]  : nil;
+        if (!axId && !cls) {
+            @throw [NSException exceptionWithName:@"BadParams"
+                                           reason:@"pass ax_id or class"
+                                         userInfo:nil];
+        }
+        __block NSString *text = nil;
+        __block NSString *axLabel = nil;
+        __block NSString *axValue = nil;
+        __block NSString *foundClass = nil;
+        __block NSString *foundAxId = nil;
+        __block BOOL found = NO;
+        dispatch_sync(dispatch_get_main_queue(), ^{
+            UIView *v = axId ? ism_find_view_by_ax_id(axId) : ism_find_view_by_class(cls);
+            if (!v) return;
+            found = YES;
+            text = ism_view_text_content(v);
+            axLabel = v.accessibilityLabel;
+            axValue = v.accessibilityValue;
+            foundClass = NSStringFromClass([v class]);
+            foundAxId = v.accessibilityIdentifier;
+        });
+        return @{
+            @"found": @(found),
+            @"text": text ?: [NSNull null],
+            @"ax_label": axLabel ?: @"",
+            @"ax_value": axValue ?: @"",
+            @"class": foundClass ?: @"",
+            @"ax_id": foundAxId ?: @"",
+        };
+    });
+
+    // view_set_text: mutate the text of a UILabel / UITextField / UITextView /
+    // any view that responds to setText:. Avoids the full eval_js dance and
+    // the focus-the-field-first ceremony of paste_text — useful when you want
+    // to seed test data directly into a non-focused field.
+    ism_register_method(@"view_set_text", ^NSDictionary *(NSDictionary *params) {
+        NSString *axId  = [params[@"ax_id"]  isKindOfClass:[NSString class]] ? params[@"ax_id"]  : nil;
+        NSString *cls   = [params[@"class"]  isKindOfClass:[NSString class]] ? params[@"class"]  : nil;
+        NSString *text  = [params[@"text"]   isKindOfClass:[NSString class]] ? params[@"text"]   : nil;
+        if (!text) @throw [NSException exceptionWithName:@"BadParams" reason:@"text required" userInfo:nil];
+        if (!axId && !cls) @throw [NSException exceptionWithName:@"BadParams" reason:@"pass ax_id or class" userInfo:nil];
+
+        __block BOOL ok = NO;
+        __block NSString *err = nil;
+        __block NSString *foundClass = nil;
+        dispatch_sync(dispatch_get_main_queue(), ^{
+            UIView *v = axId ? ism_find_view_by_ax_id(axId) : ism_find_view_by_class(cls);
+            if (!v) { err = @"view not found"; return; }
+            foundClass = NSStringFromClass([v class]);
+            SEL sel = @selector(setText:);
+            if (![v respondsToSelector:sel]) {
+                err = [NSString stringWithFormat:@"%@ does not respond to setText:", foundClass];
+                return;
+            }
+            #pragma clang diagnostic push
+            #pragma clang diagnostic ignored "-Warc-performSelector-leaks"
+            [v performSelector:sel withObject:text];
+            #pragma clang diagnostic pop
+            ok = YES;
+        });
+        if (!ok) @throw [NSException exceptionWithName:@"Failed" reason:err ?: @"unknown" userInfo:nil];
+        return @{@"set": @YES, @"class": foundClass ?: @"", @"chars": @(text.length)};
+    });
+
     // -------- JS eval bridge (Layer 2e) --------
 
     // eval_js: runs arbitrary JavaScript in a persistent JSContext bridged to

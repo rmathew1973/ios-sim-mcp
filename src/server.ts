@@ -466,6 +466,47 @@ server.registerTool("view_hit_test", {
   } catch (e) { return err(e); }
 });
 
+// -------- View text helpers --------
+
+server.registerTool("view_get_text", {
+  description: "Look up a view by AXUniqueId or class name and return its text content (UILabel.text / UIButton.currentTitle / UITextField.text / UITextView.text), plus accessibility label/value as fallback context. Faster than view_tree when you just need 'what does this control say right now?'. Requires the dylib injected.",
+  inputSchema: {
+    bundle_id: z.string().optional(),
+    ax_id: z.string().optional(),
+    class: z.string().optional(),
+  },
+}, async ({ bundle_id, ax_id, class: cls }) => {
+  try {
+    const client = await getDylibClient(bundle_id);
+    const r: any = await client.call("view_get_text", { ax_id, class: cls });
+    if (!r.found) return txt(`(no view matched ${ax_id ? `ax_id=${ax_id}` : `class=${cls}`})`);
+    const parts = [
+      `class=${r.class}`,
+      r.ax_id ? `ax_id=${r.ax_id}` : null,
+      r.text !== null ? `text=${JSON.stringify(r.text)}` : null,
+      r.ax_label ? `ax_label=${JSON.stringify(r.ax_label)}` : null,
+      r.ax_value ? `ax_value=${JSON.stringify(r.ax_value)}` : null,
+    ].filter(Boolean);
+    return txt(parts.join("  "));
+  } catch (e) { return err(e); }
+});
+
+server.registerTool("view_set_text", {
+  description: "Set the text on a UILabel / UITextField / UITextView / any view that responds to setText:. Bypasses focus + keyboard entirely. Use to seed test data directly into a non-focused field, or to programmatically change a label's text mid-test. Requires the dylib injected.",
+  inputSchema: {
+    bundle_id: z.string().optional(),
+    ax_id: z.string().optional(),
+    class: z.string().optional(),
+    text: z.string(),
+  },
+}, async ({ bundle_id, ax_id, class: cls, text }) => {
+  try {
+    const client = await getDylibClient(bundle_id);
+    const r: any = await client.call("view_set_text", { ax_id, class: cls, text });
+    return txt(`set ${r.chars} chars on ${r.class}`);
+  } catch (e) { return err(e); }
+});
+
 // -------- Layer 2e JavaScript eval bridge --------
 
 server.registerTool("eval_js", {

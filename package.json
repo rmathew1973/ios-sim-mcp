@@ -1,15 +1,56 @@
 {
   "name": "ios-sim-mcp",
-  "module": "src/server.ts",
+  "version": "0.2.0",
+  "description": "MCP server that drives the iOS Simulator via semantic accessibility-tree snapshots with stable refs. Includes an injectable dylib for in-process view introspection, HTTP capture, JavaScript eval, and byte-perfect text input. Chrome-DevTools-quality DX for iOS.",
   "type": "module",
-  "private": true,
-  "version": "0.1.0",
+  "module": "src/server.ts",
   "bin": {
     "ios-sim-mcp": "src/server.ts"
   },
   "scripts": {
     "start": "bun run src/server.ts",
-    "dev": "bun run --watch src/server.ts"
+    "dev": "bun run --watch src/server.ts",
+    "test": "bun run test/all.ts",
+    "build:dylib": "./dylib/build.sh",
+    "prepublishOnly": "./dylib/build.sh"
+  },
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "ios",
+    "ios-simulator",
+    "automation",
+    "ui-testing",
+    "accessibility",
+    "claude",
+    "anthropic",
+    "idb",
+    "url-protocol",
+    "swiftui",
+    "uikit"
+  ],
+  "author": "Russell Mathews <rmathew1973@gmail.com>",
+  "license": "MIT",
+  "homepage": "https://github.com/rmathew1973/ios-sim-mcp#readme",
+  "bugs": {
+    "url": "https://github.com/rmathew1973/ios-sim-mcp/issues"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/rmathew1973/ios-sim-mcp.git"
+  },
+  "os": ["darwin"],
+  "files": [
+    "src/**/*.ts",
+    "dylib/ios_sim_mcp_dylib.m",
+    "dylib/build.sh",
+    "dylib/build/libios-sim-mcp.dylib",
+    "README.md",
+    "LICENSE",
+    "CLAUDE.md"
+  ],
+  "engines": {
+    "bun": ">=1.0.0"
   },
   "devDependencies": {
     "@types/bun": "latest"

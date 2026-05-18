@@ -35,29 +35,52 @@ Three layers, two shipping today:
 
 ## Install
 
-```bash
-git clone https://github.com/rmathew1973/ios-sim-mcp.git
-cd ios-sim-mcp
-bun install
-```
-
-### Register with Claude Code
+### Quickest path (npm + npx)
 
 ```bash
-claude mcp add -s user ios-sim -- bun run "$(pwd)/src/server.ts"
+# Register with Claude Code, one line:
+claude mcp add -s user ios-sim -- npx -y ios-sim-mcp
 ```
 
-Verify:
+`npx` will fetch the package on first run. Verify:
 
 ```bash
 claude mcp list | grep ios-sim     # ios-sim: ... ✓ Connected
 ```
 
-Available in any **new** Claude Code session.
+Layer 2 dylib comes prebuilt for Apple Silicon. If you're on Intel Mac or want to rebuild, `cd $(npm root -g)/ios-sim-mcp && ./dylib/build.sh`.
+
+### From source
+
+```bash
+git clone https://github.com/rmathew1973/ios-sim-mcp.git
+cd ios-sim-mcp
+bun install
+./dylib/build.sh         # builds the Layer 2 dylib (only needed if you'll use inject:true)
+```
+
+Then register:
+
+```bash
+claude mcp add -s user ios-sim -- bun run "$(pwd)/src/server.ts"
+```
 
 ### Register with Claude Desktop
 
 Add to `~/Library/Application Support/Claude/claude_desktop_config.json`:
+
+```json
+{
+  "mcpServers": {
+    "ios-sim": {
+      "command": "npx",
+      "args": ["-y", "ios-sim-mcp"]
+    }
+  }
+}
+```
+
+Or, if installed from source, point at the local path:
 
 ```json
 {
