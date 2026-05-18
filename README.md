@@ -18,8 +18,10 @@ Three layers, two shipping today:
 |-------|--------|------|-------------------|
 | 1 — AX tree + actions | ✅ shipping | `idb` (Facebook's CoreSimulator bridge) | snapshot, find, tap, type, swipe, scroll, launch, screenshot — all ~100ms |
 | 2a — Dylib proof-of-life | ✅ shipping | `DYLD_INSERT_LIBRARIES` via `SIMCTL_CHILD_*` | constructor runs in the target app before `main()`; logs lifecycle via `os_log` |
-| 2b — In-process RPC | ✅ shipping | Unix socket + JSON-Lines | round-trip into a running app at **~1ms per call**; `dylib_ping` / `dylib_info` / `dylib_call` |
-| 2c–2e — Introspection | 🚧 next | Obj-C runtime | live `UIView` hierarchy, JavaScriptCore eval, `URLProtocol` network interception |
+| 2b — In-process RPC | ✅ shipping | Unix socket + JSON-Lines | round-trip into a running app at **~1ms per call** |
+| 2c — View introspection | ✅ shipping | Main-thread UIView walk | `view_tree`, `view_hit_test` — class hierarchy, frames, responder chains, VC annotations |
+| 2d — Network interception | ✅ shipping | `URLProtocol` + `URLSessionConfiguration` swizzle | capture every HTTP request/response (headers, bodies, timing) inside the app — no cert install, no mitmproxy |
+| 2e — JS eval | 🚧 next | `JSContext` | `eval_js({code})` against the running app |
 | 3 — System logs | ✅ shipping | `xcrun simctl spawn log stream` | streaming os_log into a 5000-line ring buffer |
 
 `idb` talks directly to CoreSimulator's private framework — no WebDriverAgent, no HTTP hop into the simulator process — which is why the per-call latency is closer to a local subprocess than to a network round trip.
@@ -87,6 +89,11 @@ It's a standard stdio MCP server. Run `bun run src/server.ts` and pipe JSON-RPC.
 | `paste_text` | Byte-perfect text via `UIPasteboard` + first-responder `paste:`. Requires the dylib injected. The right answer for emails, passwords, OAuth tokens, anything case-sensitive |
 | `view_tree` | Walk the running app's `UIView` hierarchy on the main thread. Reports class names, frames in window coords, alpha/hidden/interactive, text content, and annotates view-controller boundaries. Strictly richer than `snapshot` — sees custom-drawn views, transient overlays, SwiftUI internals. Filter by `class_filter` / `ax_id_contains` / `text_contains`. Requires dylib injected |
 | `view_hit_test` | "What view actually receives a tap at (x,y)?" Returns the topmost view plus the full responder chain up to `UIApplication`. The right debugging tool when a `tap` isn't doing what you expect. Requires dylib injected |
+| `network_start` / `network_stop` / `network_status` | Install/remove an `URLProtocol` interceptor + swizzle `URLSessionConfiguration` so every `URLSession`-based HTTP request flowing through the app is recorded. Options: `max_records`, `max_body_bytes`, `filter_url_substring`. Requires dylib injected |
+| `network_tail` | Return the most recent N captured records. Default: one line per request (id, method, status, timing, sizes, URL). `full=true` includes headers + body previews inline. Page forward via `since_id` |
+| `network_get_body` | Fetch the full request or response body (up to `max_body_bytes`, default 256KB) for a specific record id. Returns base64 + UTF-8 decode for text bodies |
+| `network_clear` | Drop the ring buffer and all retained bodies |
+| `network_self_test` | Fire an HTTP request from inside the app to verify the capture path end-to-end |
 | `key` | Press a key by name (RETURN, ESC, DELETE, TAB, SPACE, F1–F12, arrows) or raw HID code |
 | `button` | Hardware button: HOME, LOCK, SIDE_BUTTON, SIRI, APPLE_PAY |
 | `swipe` | Swipe between two refs/ids/points. Optional `duration` and `delta` |
@@ -197,9 +204,35 @@ Both inspect the running UI but they read different trees:
 
 **Rule of thumb:** use `snapshot` + `find` for "tap this control" workflows (especially in SwiftUI apps); use `view_tree` for "what's actually on screen and why isn't this working" investigation.
 
+## Network capture (Layer 2d)
+
+```ts
+launch_app({ bundle_id: "com.yourco.app", inject: true })
+network_start({ max_body_bytes: 262144 })
+// ... use the app normally ...
+network_tail({ n: 20, full: true })
+// → #34 POST 201 142ms ttfb=98ms reqB=312B resB=2.3KB application/json  https://api.yourco.com/orders
+//     request_headers:
+//       Authorization: Bearer eyJhbG...
+//       Content-Type: application/json
+//     request_body:
+//       {"sku":"PRO_MONTHLY","quantity":1,"coupon":"WELCOME10"}
+//     response_body:
+//       {"order_id":"ord_8a3f2c","total":2700,...}
+network_get_body({ id: 34, which: "response" })  // full body if it was truncated
+```
+
+**Scope:**
+
+- ✅ Catches all `URLSession`-based traffic: native `URLSession`, `URLRequest`, Alamofire, SwiftUI `AsyncImage`, anything that consumes `URLSessionConfiguration.default` or `.ephemeral`
+- ✅ Decrypted HTTP/HTTPS bodies — we sit inside the URLSession pipeline above TLS
+- ✅ No certificate install, no mitmproxy, no proxy config
+- ⚠️ Does NOT catch: raw `CFNetwork` / `nw_connection_t` (low-level networking written against the BSD socket layer), background `URLSession`s, gRPC libraries that bypass URLSession, `WKWebView` resource loads (separate process)
+- ⚠️ `HTTPBodyStream` request bodies are noted but not captured (would require draining + rewinding the stream)
+- ⚠️ Sessions constructed *before* `network_start` are not retro-fitted; restart the app or relaunch with `inject:true` if you need to catch app-startup traffic
+
 ## Roadmap
 
-- **Layer 2d** — `URLProtocol` interceptor for network bodies (the big unlock).
 - **Layer 2e** — `JSContext` bridge: `eval_js({code})` against a running app.
 - **`describe_point`** — "what's under (x,y)?" for debugging gesture targets.
 - **Video recording** — wrap `idb record-video` as `record_start`/`record_stop`.

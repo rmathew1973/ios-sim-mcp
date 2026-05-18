@@ -24,6 +24,7 @@
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
 #import <os/log.h>
+#import <objc/runtime.h>
 #include <unistd.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -292,6 +293,276 @@ static UIResponder *ism_find_first_responder(void) {
         if (r) return r;
     }
     return nil;
+}
+
+#pragma mark - Network interception (Layer 2d)
+
+// Strategy:
+//   1. ISMURLProtocol subclasses NSURLProtocol. canInitWithRequest claims
+//      http/https requests (unless marked with our re-entry flag).
+//   2. We swizzle +[NSURLSessionConfiguration defaultSessionConfiguration]
+//      and +ephemeralSessionConfiguration to prepend ISMURLProtocol to the
+//      returned config's protocolClasses. Modern URLSession-based code
+//      (Alamofire, URLRequest, SwiftUI AsyncImage, NSURLSession native) all
+//      flow through one of these two configs.
+//   3. In startLoading we forward via a fresh ephemeral session whose
+//      configuration is fetched via the ORIGINAL ephemeral IMP (bypassing
+//      the swizzle to break recursion). Plus we set a re-entry flag on the
+//      forwarded request so canInitWithRequest declines it even if the
+//      original config still has our protocol.
+//   4. We push a record into a ring buffer (default 500 records) and store
+//      full request/response bodies in side dictionaries keyed by id (capped
+//      to max_body_bytes; full bytes available via network_get_body).
+
+static NSMutableArray<NSMutableDictionary *> *ism_net_records = nil;
+static NSMutableDictionary<NSNumber *, NSData *> *ism_net_request_bodies = nil;
+static NSMutableDictionary<NSNumber *, NSData *> *ism_net_response_bodies = nil;
+static NSLock *ism_net_lock = nil;
+static int64_t ism_net_next_id = 0;
+static NSInteger ism_net_max_records = 500;
+static NSInteger ism_net_max_body_bytes = 256 * 1024; // 256 KB
+static NSString *ism_net_url_filter = nil; // substring; if non-nil, only matching URLs are recorded
+static BOOL ism_net_running = NO;
+
+// Original IMPs captured before swizzling.
+static IMP ism_orig_defaultConfig_imp = NULL;
+static IMP ism_orig_ephemeralConfig_imp = NULL;
+
+static NSString * const kISMHandledKey = @"com.hmbsoftware.ios-sim-mcp.handled";
+
+static NSString *ism_body_preview_string(NSData *data, NSUInteger maxBytes, BOOL *outIsBinary) {
+    if (data.length == 0) return @"";
+    NSUInteger n = MIN(data.length, maxBytes);
+    NSData *slice = [data subdataWithRange:NSMakeRange(0, n)];
+    NSString *s = [[NSString alloc] initWithData:slice encoding:NSUTF8StringEncoding];
+    if (s) {
+        if (outIsBinary) *outIsBinary = NO;
+        // Cap render length so single huge text bodies don't blow JSON response size.
+        const NSUInteger maxRenderChars = 8192;
+        if (s.length > maxRenderChars) {
+            s = [[s substringToIndex:maxRenderChars] stringByAppendingFormat:@"…(+%lu chars)", (unsigned long)(s.length - maxRenderChars)];
+        }
+        return s;
+    }
+    if (outIsBinary) *outIsBinary = YES;
+    return [NSString stringWithFormat:@"<binary %lu bytes>", (unsigned long)data.length];
+}
+
+static BOOL ism_url_passes_filter(NSURL *url) {
+    if (!ism_net_url_filter) return YES;
+    return [url.absoluteString rangeOfString:ism_net_url_filter options:NSCaseInsensitiveSearch].location != NSNotFound;
+}
+
+static int64_t ism_net_record_started(NSURLRequest *request) {
+    if (!ism_url_passes_filter(request.URL)) return 0;
+    [ism_net_lock lock];
+    int64_t recordId = ++ism_net_next_id;
+    NSMutableDictionary *rec = [NSMutableDictionary dictionary];
+    rec[@"id"] = @(recordId);
+    rec[@"url"] = request.URL.absoluteString ?: @"";
+    rec[@"method"] = request.HTTPMethod ?: @"GET";
+    rec[@"request_headers"] = request.allHTTPHeaderFields ?: @{};
+    rec[@"started_at_ms"] = @((long long)([[NSDate date] timeIntervalSince1970] * 1000.0));
+
+    NSData *body = request.HTTPBody;
+    if (body) {
+        rec[@"request_body_size"] = @(body.length);
+        BOOL bin = NO;
+        rec[@"request_body_preview"] = ism_body_preview_string(body, (NSUInteger)ism_net_max_body_bytes, &bin);
+        rec[@"request_body_binary"] = @(bin);
+        rec[@"request_body_truncated"] = @(body.length > (NSUInteger)ism_net_max_body_bytes);
+        ism_net_request_bodies[@(recordId)] = body;
+    } else if (request.HTTPBodyStream) {
+        rec[@"request_body_preview"] = @"(HTTPBodyStream — not captured in 2d)";
+        rec[@"request_body_size"] = @-1;
+    }
+
+    [ism_net_records addObject:rec];
+    while (ism_net_records.count > (NSUInteger)ism_net_max_records) {
+        NSMutableDictionary *evicted = ism_net_records.firstObject;
+        [ism_net_records removeObjectAtIndex:0];
+        NSNumber *evId = evicted[@"id"];
+        if (evId) {
+            [ism_net_request_bodies removeObjectForKey:evId];
+            [ism_net_response_bodies removeObjectForKey:evId];
+        }
+    }
+    [ism_net_lock unlock];
+    return recordId;
+}
+
+static void ism_net_record_completed(int64_t recordId, NSURLResponse *response, NSData *body, NSDate *startedAt, NSDate *respStartedAt, NSError *error) {
+    if (recordId == 0) return;
+    [ism_net_lock lock];
+    NSMutableDictionary *rec = nil;
+    for (NSMutableDictionary *r in ism_net_records) {
+        if ([r[@"id"] longLongValue] == recordId) { rec = r; break; }
+    }
+    if (!rec) { [ism_net_lock unlock]; return; }
+
+    NSDate *now = [NSDate date];
+    rec[@"ended_at_ms"] = @((long long)([now timeIntervalSince1970] * 1000.0));
+    rec[@"duration_ms"] = @((long long)([now timeIntervalSinceDate:startedAt] * 1000.0));
+    if (respStartedAt) {
+        rec[@"ttfb_ms"] = @((long long)([respStartedAt timeIntervalSinceDate:startedAt] * 1000.0));
+    }
+
+    if ([response isKindOfClass:[NSHTTPURLResponse class]]) {
+        NSHTTPURLResponse *http = (NSHTTPURLResponse *)response;
+        rec[@"status"] = @(http.statusCode);
+        rec[@"response_headers"] = http.allHeaderFields ?: @{};
+    }
+    if (response.MIMEType) rec[@"mime"] = response.MIMEType;
+
+    if (body) {
+        rec[@"response_body_size"] = @(body.length);
+        BOOL bin = NO;
+        rec[@"response_body_preview"] = ism_body_preview_string(body, (NSUInteger)ism_net_max_body_bytes, &bin);
+        rec[@"response_body_binary"] = @(bin);
+        rec[@"response_body_truncated"] = @(body.length > (NSUInteger)ism_net_max_body_bytes);
+        ism_net_response_bodies[@(recordId)] = body;
+    }
+
+    if (error) {
+        rec[@"error"] = error.localizedDescription ?: [error description];
+        rec[@"error_code"] = @(error.code);
+        rec[@"error_domain"] = error.domain ?: @"";
+    }
+    [ism_net_lock unlock];
+}
+
+// ISMURLProtocol -------------------------------------------------------------
+
+@interface ISMURLProtocol : NSURLProtocol <NSURLSessionDataDelegate>
+@end
+
+@implementation ISMURLProtocol {
+    NSURLSession         *_session;
+    NSURLSessionDataTask *_task;
+    NSMutableData        *_responseData;
+    int64_t               _recordId;
+    NSDate               *_startedAt;
+    NSDate               *_responseStartedAt;
+}
+
++ (BOOL)canInitWithRequest:(NSURLRequest *)request {
+    if ([NSURLProtocol propertyForKey:kISMHandledKey inRequest:request]) return NO;
+    NSString *scheme = request.URL.scheme.lowercaseString;
+    if (!scheme) return NO;
+    return [scheme isEqualToString:@"http"] || [scheme isEqualToString:@"https"];
+}
+
++ (NSURLRequest *)canonicalRequestForRequest:(NSURLRequest *)request { return request; }
++ (BOOL)requestIsCacheEquivalent:(NSURLRequest *)a toRequest:(NSURLRequest *)b { return NO; }
+
+- (void)startLoading {
+    _startedAt = [NSDate date];
+    _responseData = [NSMutableData data];
+    _recordId = ism_net_record_started(self.request);
+
+    NSMutableURLRequest *forward = [self.request mutableCopy];
+    [NSURLProtocol setProperty:@YES forKey:kISMHandledKey inRequest:forward];
+
+    // Build a config WITHOUT our protocol to avoid re-entry — call the ORIGINAL
+    // ephemeral IMP directly, bypassing our swizzle.
+    NSURLSessionConfiguration *config = nil;
+    if (ism_orig_ephemeralConfig_imp) {
+        config = ((NSURLSessionConfiguration *(*)(Class, SEL))ism_orig_ephemeralConfig_imp)
+            ([NSURLSessionConfiguration class], @selector(ephemeralSessionConfiguration));
+    } else {
+        config = [NSURLSessionConfiguration ephemeralSessionConfiguration];
+    }
+    // Defensive: strip our protocol in case the original IMP returned a config
+    // that includes it (it shouldn't, but be safe).
+    NSMutableArray *protos = [config.protocolClasses mutableCopy] ?: [NSMutableArray array];
+    [protos removeObject:[ISMURLProtocol class]];
+    config.protocolClasses = protos;
+
+    _session = [NSURLSession sessionWithConfiguration:config delegate:self delegateQueue:nil];
+    _task = [_session dataTaskWithRequest:forward];
+    [_task resume];
+}
+
+- (void)stopLoading {
+    [_task cancel];
+    [_session invalidateAndCancel];
+    _session = nil;
+    _task = nil;
+}
+
+- (void)URLSession:(NSURLSession *)session
+          dataTask:(NSURLSessionDataTask *)dataTask
+didReceiveResponse:(NSURLResponse *)response
+ completionHandler:(void (^)(NSURLSessionResponseDisposition))completionHandler {
+    _responseStartedAt = [NSDate date];
+    [self.client URLProtocol:self didReceiveResponse:response cacheStoragePolicy:NSURLCacheStorageNotAllowed];
+    completionHandler(NSURLSessionResponseAllow);
+}
+
+- (void)URLSession:(NSURLSession *)session
+          dataTask:(NSURLSessionDataTask *)dataTask
+    didReceiveData:(NSData *)data {
+    [_responseData appendData:data];
+    [self.client URLProtocol:self didLoadData:data];
+}
+
+- (void)URLSession:(NSURLSession *)session
+              task:(NSURLSessionTask *)task
+didCompleteWithError:(NSError *)error {
+    ism_net_record_completed(_recordId, task.response, _responseData, _startedAt, _responseStartedAt, error);
+    if (error) [self.client URLProtocol:self didFailWithError:error];
+    else       [self.client URLProtocolDidFinishLoading:self];
+}
+
+@end
+
+// Swizzles for default + ephemeral configs ----------------------------------
+
+static NSURLSessionConfiguration *ism_swizzled_default(Class self, SEL _cmd) {
+    NSURLSessionConfiguration *c = ((NSURLSessionConfiguration *(*)(Class, SEL))ism_orig_defaultConfig_imp)(self, _cmd);
+    NSMutableArray *cls = [c.protocolClasses mutableCopy] ?: [NSMutableArray array];
+    if (![cls containsObject:[ISMURLProtocol class]]) {
+        [cls insertObject:[ISMURLProtocol class] atIndex:0];
+        c.protocolClasses = cls;
+    }
+    return c;
+}
+
+static NSURLSessionConfiguration *ism_swizzled_ephemeral(Class self, SEL _cmd) {
+    NSURLSessionConfiguration *c = ((NSURLSessionConfiguration *(*)(Class, SEL))ism_orig_ephemeralConfig_imp)(self, _cmd);
+    NSMutableArray *cls = [c.protocolClasses mutableCopy] ?: [NSMutableArray array];
+    if (![cls containsObject:[ISMURLProtocol class]]) {
+        [cls insertObject:[ISMURLProtocol class] atIndex:0];
+        c.protocolClasses = cls;
+    }
+    return c;
+}
+
+static void ism_install_network_swizzles(void) {
+    if (ism_orig_defaultConfig_imp) return; // already installed
+    Method m1 = class_getClassMethod([NSURLSessionConfiguration class], @selector(defaultSessionConfiguration));
+    if (m1) {
+        ism_orig_defaultConfig_imp = method_getImplementation(m1);
+        method_setImplementation(m1, (IMP)ism_swizzled_default);
+    }
+    Method m2 = class_getClassMethod([NSURLSessionConfiguration class], @selector(ephemeralSessionConfiguration));
+    if (m2) {
+        ism_orig_ephemeralConfig_imp = method_getImplementation(m2);
+        method_setImplementation(m2, (IMP)ism_swizzled_ephemeral);
+    }
+}
+
+static void ism_remove_network_swizzles(void) {
+    if (ism_orig_defaultConfig_imp) {
+        Method m1 = class_getClassMethod([NSURLSessionConfiguration class], @selector(defaultSessionConfiguration));
+        if (m1) method_setImplementation(m1, ism_orig_defaultConfig_imp);
+        ism_orig_defaultConfig_imp = NULL;
+    }
+    if (ism_orig_ephemeralConfig_imp) {
+        Method m2 = class_getClassMethod([NSURLSessionConfiguration class], @selector(ephemeralSessionConfiguration));
+        if (m2) method_setImplementation(m2, ism_orig_ephemeralConfig_imp);
+        ism_orig_ephemeralConfig_imp = NULL;
+    }
 }
 
 #pragma mark - View introspection helpers (main-thread only)
@@ -590,6 +861,184 @@ static void ism_register_builtins(NSString *bundleId, NSString *processName, NSS
                                                    reason:@"no key window available"
                                                  userInfo:nil];
         return result;
+    });
+
+    // -------- Network interception RPC (Layer 2d) --------
+
+    ism_register_method(@"network_start", ^NSDictionary *(NSDictionary *params) {
+        if (!ism_net_lock) {
+            ism_net_lock = [[NSLock alloc] init];
+            ism_net_records = [NSMutableArray array];
+            ism_net_request_bodies = [NSMutableDictionary dictionary];
+            ism_net_response_bodies = [NSMutableDictionary dictionary];
+        }
+        id v;
+        if ((v = params[@"max_records"])    && [v isKindOfClass:[NSNumber class]]) ism_net_max_records = [v integerValue];
+        if ((v = params[@"max_body_bytes"]) && [v isKindOfClass:[NSNumber class]]) ism_net_max_body_bytes = [v integerValue];
+        if ((v = params[@"filter_url_substring"]) && [v isKindOfClass:[NSString class]] && ((NSString *)v).length > 0) {
+            ism_net_url_filter = [v copy];
+        } else {
+            ism_net_url_filter = nil;
+        }
+        if (!ism_net_running) {
+            [NSURLProtocol registerClass:[ISMURLProtocol class]];
+            ism_install_network_swizzles();
+            ism_net_running = YES;
+        }
+        return @{
+            @"running": @YES,
+            @"max_records": @(ism_net_max_records),
+            @"max_body_bytes": @(ism_net_max_body_bytes),
+            @"filter_url_substring": ism_net_url_filter ?: [NSNull null],
+            @"note": @"URLSession-based traffic (default + ephemeral configs). Existing sessions constructed before start are not retro-fitted.",
+        };
+    });
+
+    ism_register_method(@"network_stop", ^NSDictionary *(NSDictionary *params) {
+        if (ism_net_running) {
+            [NSURLProtocol unregisterClass:[ISMURLProtocol class]];
+            ism_remove_network_swizzles();
+            ism_net_running = NO;
+        }
+        return @{@"running": @NO};
+    });
+
+    ism_register_method(@"network_status", ^NSDictionary *(NSDictionary *params) {
+        NSUInteger count = 0;
+        if (ism_net_lock) { [ism_net_lock lock]; count = ism_net_records.count; [ism_net_lock unlock]; }
+        return @{
+            @"running": @(ism_net_running),
+            @"records_held": @(count),
+            @"next_id": @(ism_net_next_id),
+            @"max_records": @(ism_net_max_records),
+            @"max_body_bytes": @(ism_net_max_body_bytes),
+            @"filter_url_substring": ism_net_url_filter ?: [NSNull null],
+        };
+    });
+
+    ism_register_method(@"network_tail", ^NSDictionary *(NSDictionary *params) {
+        NSInteger n = 50;
+        int64_t sinceId = 0;
+        BOOL includeHeaders = NO;
+        BOOL includePreviews = YES;
+        id v;
+        if ((v = params[@"n"])               && [v isKindOfClass:[NSNumber class]]) n = [v integerValue];
+        if ((v = params[@"since_id"])        && [v isKindOfClass:[NSNumber class]]) sinceId = [v longLongValue];
+        if ((v = params[@"include_headers"]) && [v isKindOfClass:[NSNumber class]]) includeHeaders = [v boolValue];
+        if ((v = params[@"include_previews"])&& [v isKindOfClass:[NSNumber class]]) includePreviews = [v boolValue];
+
+        NSMutableArray *out = [NSMutableArray array];
+        if (ism_net_lock) {
+            [ism_net_lock lock];
+            // Filter by sinceId, then take last n.
+            NSMutableArray *eligible = [NSMutableArray array];
+            for (NSDictionary *r in ism_net_records) {
+                if ([r[@"id"] longLongValue] > sinceId) [eligible addObject:r];
+            }
+            NSUInteger start = eligible.count > (NSUInteger)n ? eligible.count - n : 0;
+            for (NSUInteger i = start; i < eligible.count; i++) {
+                NSDictionary *r = eligible[i];
+                if (includeHeaders && includePreviews) {
+                    [out addObject:r];
+                } else {
+                    NSMutableDictionary *m = [r mutableCopy];
+                    if (!includeHeaders) {
+                        [m removeObjectForKey:@"request_headers"];
+                        [m removeObjectForKey:@"response_headers"];
+                    }
+                    if (!includePreviews) {
+                        [m removeObjectForKey:@"request_body_preview"];
+                        [m removeObjectForKey:@"response_body_preview"];
+                    }
+                    [out addObject:m];
+                }
+            }
+            [ism_net_lock unlock];
+        }
+        return @{
+            @"records": out,
+            @"running": @(ism_net_running),
+        };
+    });
+
+    ism_register_method(@"network_get_body", ^NSDictionary *(NSDictionary *params) {
+        id idVal = params[@"id"];
+        id whichVal = params[@"which"];
+        if (![idVal isKindOfClass:[NSNumber class]]) {
+            @throw [NSException exceptionWithName:@"BadParams" reason:@"`id` must be a number" userInfo:nil];
+        }
+        NSString *which = [whichVal isKindOfClass:[NSString class]] ? whichVal : @"response";
+        NSNumber *key = idVal;
+        NSData *body = nil;
+        if (ism_net_lock) {
+            [ism_net_lock lock];
+            body = [which isEqualToString:@"request"] ? ism_net_request_bodies[key] : ism_net_response_bodies[key];
+            [ism_net_lock unlock];
+        }
+        if (!body) {
+            return @{@"found": @NO, @"id": idVal, @"which": which};
+        }
+        BOOL isBin = NO;
+        NSString *preview = ism_body_preview_string(body, body.length, &isBin);
+        return @{
+            @"found": @YES,
+            @"id": idVal,
+            @"which": which,
+            @"size": @(body.length),
+            @"binary": @(isBin),
+            @"base64": [body base64EncodedStringWithOptions:0],
+            @"text": isBin ? @"" : preview,
+        };
+    });
+
+    ism_register_method(@"network_clear", ^NSDictionary *(NSDictionary *params) {
+        if (ism_net_lock) {
+            [ism_net_lock lock];
+            [ism_net_records removeAllObjects];
+            [ism_net_request_bodies removeAllObjects];
+            [ism_net_response_bodies removeAllObjects];
+            [ism_net_lock unlock];
+        }
+        return @{@"cleared": @YES};
+    });
+
+    // network_self_test: verifies the interception path end-to-end by firing
+    // a URLSession request from inside the dylib using the (swizzled) default
+    // config, then waiting for completion. Useful when the host app makes no
+    // network calls of its own during smoke tests.
+    ism_register_method(@"network_self_test", ^NSDictionary *(NSDictionary *params) {
+        id urlVal = params[@"url"];
+        NSString *urlStr = [urlVal isKindOfClass:[NSString class]] ? urlVal : @"https://example.com/";
+        NSURL *url = [NSURL URLWithString:urlStr];
+        if (!url) @throw [NSException exceptionWithName:@"BadParams" reason:@"invalid url" userInfo:nil];
+
+        if (!ism_net_running) {
+            @throw [NSException exceptionWithName:@"NotRunning" reason:@"call network_start first" userInfo:nil];
+        }
+
+        NSURLSessionConfiguration *config = [NSURLSessionConfiguration defaultSessionConfiguration];
+        NSURLSession *session = [NSURLSession sessionWithConfiguration:config];
+        dispatch_semaphore_t sem = dispatch_semaphore_create(0);
+        __block NSInteger status = 0;
+        __block NSUInteger bodyLen = 0;
+        __block NSString *errMsg = nil;
+        NSURLSessionDataTask *task = [session dataTaskWithURL:url
+                                            completionHandler:^(NSData *data, NSURLResponse *resp, NSError *err) {
+            if (err) errMsg = err.localizedDescription;
+            if ([resp isKindOfClass:[NSHTTPURLResponse class]]) status = ((NSHTTPURLResponse *)resp).statusCode;
+            bodyLen = data.length;
+            dispatch_semaphore_signal(sem);
+        }];
+        [task resume];
+        long waited = dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, 10 * NSEC_PER_SEC));
+        if (waited != 0) @throw [NSException exceptionWithName:@"Timeout" reason:@"self-test timed out after 10s" userInfo:nil];
+
+        return @{
+            @"url": urlStr,
+            @"status": @(status),
+            @"body_len": @(bodyLen),
+            @"error": errMsg ?: @"",
+        };
     });
 }
 

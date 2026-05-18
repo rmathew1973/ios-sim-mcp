@@ -17,6 +17,7 @@ import * as actions from "./actions.js";
 import { startLogStream, stopLogStream, tailLogs, clearLogs } from "./logs.js";
 import { DylibClient } from "./dylib_client.js";
 import { renderViewTree, type ViewTreeResult } from "./view_tree.js";
+import { renderNetTail, type NetRecord } from "./network.js";
 
 const HID_KEYS: Record<string, number> = {
   RETURN: 40, ENTER: 40,
@@ -462,6 +463,113 @@ server.registerTool("view_hit_test", {
       `  interactive=${h.interactive}  alpha=${h.alpha}\n` +
       `\nresponder chain:\n${chainLines}`,
     );
+  } catch (e) { return err(e); }
+});
+
+// -------- Layer 2d network interception --------
+
+server.registerTool("network_start", {
+  description: "Start capturing HTTP traffic from the injected app's URLSession-based code. Installs an URLProtocol subclass + swizzles +defaultSessionConfiguration / +ephemeralSessionConfiguration so requests made via Alamofire, URLRequest, SwiftUI AsyncImage, or any URLSession-based client are recorded into an in-process ring buffer. Existing URLSessions constructed before start are NOT retro-fitted. Requires dylib injected.",
+  inputSchema: {
+    bundle_id: z.string().optional(),
+    max_records: z.number().int().positive().optional(),
+    max_body_bytes: z.number().int().positive().optional(),
+    filter_url_substring: z.string().optional(),
+  },
+}, async ({ bundle_id, max_records, max_body_bytes, filter_url_substring }) => {
+  try {
+    const client = await getDylibClient(bundle_id);
+    const result = await client.call("network_start", { max_records, max_body_bytes, filter_url_substring });
+    return txt(JSON.stringify(result, null, 2));
+  } catch (e) { return err(e); }
+});
+
+server.registerTool("network_stop", {
+  description: "Stop capturing HTTP traffic. The ring buffer is preserved until network_clear; you can keep calling network_tail on captured records after stopping.",
+  inputSchema: { bundle_id: z.string().optional() },
+}, async ({ bundle_id }) => {
+  try {
+    const client = await getDylibClient(bundle_id);
+    const result = await client.call("network_stop", {});
+    return txt(JSON.stringify(result, null, 2));
+  } catch (e) { return err(e); }
+});
+
+server.registerTool("network_status", {
+  description: "Report whether capture is running, how many records are held, and current config (max_records, max_body_bytes, filter).",
+  inputSchema: { bundle_id: z.string().optional() },
+}, async ({ bundle_id }) => {
+  try {
+    const client = await getDylibClient(bundle_id);
+    const result = await client.call("network_status", {});
+    return txt(JSON.stringify(result, null, 2));
+  } catch (e) { return err(e); }
+});
+
+server.registerTool("network_tail", {
+  description: "Return the most recent N captured records (default 50). Each record shows id, method, status, timing, sizes, URL. Pass full=true to include headers + body previews inline; otherwise call network_get_body({id}) to fetch a specific full body. Use since_id to page forward from a previous tail.",
+  inputSchema: {
+    bundle_id: z.string().optional(),
+    n: z.number().int().positive().optional(),
+    since_id: z.number().int().nonnegative().optional(),
+    full: z.boolean().optional(),
+    include_headers: z.boolean().optional(),
+    include_previews: z.boolean().optional(),
+    max_body_chars: z.number().int().positive().optional(),
+  },
+}, async ({ bundle_id, n, since_id, full, include_headers, include_previews, max_body_chars }) => {
+  try {
+    const client = await getDylibClient(bundle_id);
+    const result: any = await client.call("network_tail", {
+      n,
+      since_id,
+      include_headers: include_headers ?? full ?? false,
+      include_previews: include_previews ?? full ?? false,
+    });
+    return txt(renderNetTail(result.records as NetRecord[], { full: full ?? false, maxBodyChars: max_body_chars }));
+  } catch (e) { return err(e); }
+});
+
+server.registerTool("network_get_body", {
+  description: "Fetch the full request or response body for a captured record. Bodies up to max_body_bytes (default 256KB) are retained per record; larger bodies were truncated at capture time and the response will mark truncated=true. Returns base64 plus a UTF-8 decode when the body is text.",
+  inputSchema: {
+    id: z.number().int().positive(),
+    which: z.enum(["request", "response"]).optional(),
+    bundle_id: z.string().optional(),
+  },
+}, async ({ id, which, bundle_id }) => {
+  try {
+    const client = await getDylibClient(bundle_id);
+    const result: any = await client.call("network_get_body", { id, which: which ?? "response" });
+    if (!result.found) return txt(`(no ${which ?? "response"} body retained for record #${id} — was it evicted from the ring buffer?)`);
+    const head = `#${id} ${result.which} body: ${result.size} bytes (${result.binary ? "binary" : "text"})`;
+    if (result.binary) return txt(`${head}\nbase64: ${result.base64.slice(0, 256)}…`);
+    return txt(`${head}\n\n${result.text}`);
+  } catch (e) { return err(e); }
+});
+
+server.registerTool("network_clear", {
+  description: "Drop all captured records and their bodies. Does not change running state.",
+  inputSchema: { bundle_id: z.string().optional() },
+}, async ({ bundle_id }) => {
+  try {
+    const client = await getDylibClient(bundle_id);
+    const result = await client.call("network_clear", {});
+    return txt(JSON.stringify(result, null, 2));
+  } catch (e) { return err(e); }
+});
+
+server.registerTool("network_self_test", {
+  description: "Fire a real HTTP request from inside the injected app to validate the capture path end-to-end. Useful when the host app makes no network calls of its own during a smoke test. Requires network_start first.",
+  inputSchema: {
+    bundle_id: z.string().optional(),
+    url: z.string().optional(),
+  },
+}, async ({ bundle_id, url }) => {
+  try {
+    const client = await getDylibClient(bundle_id);
+    const result = await client.call("network_self_test", { url }, { timeoutMs: 12000 });
+    return txt(JSON.stringify(result, null, 2));
   } catch (e) { return err(e); }
 });
 
