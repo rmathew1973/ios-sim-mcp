@@ -23,6 +23,7 @@
 
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
+#import <JavaScriptCore/JavaScriptCore.h>
 #import <os/log.h>
 #import <objc/runtime.h>
 #include <unistd.h>
@@ -293,6 +294,278 @@ static UIResponder *ism_find_first_responder(void) {
         if (r) return r;
     }
     return nil;
+}
+
+#pragma mark - JSExport protocols for core classes (Layer 2e)
+
+// JSC only exposes ObjC methods/properties to JS when the class conforms to a
+// JSExport-derived protocol. We add categories for the most useful classes so
+// callers can write `app.windows[0].rootViewController.title` style code.
+
+// JSExport sees @property declarations as JS value-access (no parens). It sees
+// plain method declarations as JS-callable functions. We use @property for
+// getters so callers can write `bundle.bundleIdentifier` not
+// `bundle.bundleIdentifier()`.
+
+@protocol ISMBundleExport <JSExport>
+@property (readonly, copy)   NSString     *bundleIdentifier;
+@property (readonly, copy)   NSString     *bundlePath;
+@property (readonly, copy)   NSDictionary *infoDictionary;
+@end
+@interface NSBundle (ISMExport) <ISMBundleExport> @end
+@implementation NSBundle (ISMExport) @end
+
+@protocol ISMProcessInfoExport <JSExport>
+@property (readonly, copy) NSString     *processName;
+@property (readonly)       int           processIdentifier;
+@property (readonly, copy) NSString     *hostName;
+@property (readonly, copy) NSString     *operatingSystemVersionString;
+@property (readonly, copy) NSDictionary *environment;
+@end
+@interface NSProcessInfo (ISMExport) <ISMProcessInfoExport> @end
+@implementation NSProcessInfo (ISMExport) @end
+
+@protocol ISMUserDefaultsExport <JSExport>
+- (id)objectForKey:(NSString *)key;
+- (NSString *)stringForKey:(NSString *)key;
+- (BOOL)boolForKey:(NSString *)key;
+- (NSInteger)integerForKey:(NSString *)key;
+- (double)doubleForKey:(NSString *)key;
+- (NSArray *)arrayForKey:(NSString *)key;
+- (NSDictionary *)dictionaryForKey:(NSString *)key;
+- (void)setObject:(id)value forKey:(NSString *)key;
+- (void)setBool:(BOOL)value forKey:(NSString *)key;
+- (void)setInteger:(NSInteger)value forKey:(NSString *)key;
+- (void)setDouble:(double)value forKey:(NSString *)key;
+- (void)removeObjectForKey:(NSString *)key;
+- (BOOL)synchronize;
+@end
+@interface NSUserDefaults (ISMExport) <ISMUserDefaultsExport> @end
+@implementation NSUserDefaults (ISMExport) @end
+
+@protocol ISMPasteboardExport <JSExport>
+@property (nonatomic, copy) NSString *string;
+@end
+@interface UIPasteboard (ISMExport) <ISMPasteboardExport> @end
+@implementation UIPasteboard (ISMExport) @end
+
+@protocol ISMApplicationExport <JSExport>
+@property (readonly, copy) NSArray  *windows;
+@property (readonly)       NSInteger applicationState;
+@end
+@interface UIApplication (ISMExport) <ISMApplicationExport> @end
+@implementation UIApplication (ISMExport) @end
+
+@protocol ISMViewExport <JSExport>
+@property (readonly, copy) NSArray *subviews;
+@property (readonly)       UIView  *superview;
+@property (nonatomic)      CGRect   frame;
+@property (nonatomic)      CGRect   bounds;
+@property (nonatomic)      CGFloat  alpha;
+@property (nonatomic, getter=isHidden) BOOL hidden;
+@property (nonatomic)      NSInteger tag;
+@property (nonatomic, copy) NSString *accessibilityIdentifier;
+@property (nonatomic, copy) NSString *accessibilityLabel;
+@property (nonatomic, copy) NSString *accessibilityValue;
+@property (nonatomic, getter=isUserInteractionEnabled) BOOL userInteractionEnabled;
+@property (readonly)       BOOL      isFirstResponder;
+@property (readonly)       UIWindow *window;
+@end
+@interface UIView (ISMExport) <ISMViewExport> @end
+@implementation UIView (ISMExport) @end
+
+@protocol ISMWindowExport <ISMViewExport>
+@property (readonly)       UIViewController *rootViewController;
+@property (readonly)       BOOL              isKeyWindow;
+@end
+@interface UIWindow (ISMExport) <ISMWindowExport> @end
+@implementation UIWindow (ISMExport) @end
+
+@protocol ISMViewControllerExport <JSExport>
+@property (nonatomic, copy) NSString          *title;
+@property (readonly)        UIView            *view;
+@property (readonly)        UIViewController  *presentedViewController;
+@property (readonly)        UIViewController  *presentingViewController;
+@property (readonly)        UIViewController  *parentViewController;
+@property (readonly, copy)  NSArray           *childViewControllers;
+@property (readonly)        BOOL               isViewLoaded;
+@end
+@interface UIViewController (ISMExport) <ISMViewControllerExport> @end
+@implementation UIViewController (ISMExport) @end
+
+@protocol ISMLabelExport <ISMViewExport>
+@property (nonatomic, copy) NSString *text;
+@end
+@interface UILabel (ISMExport) <ISMLabelExport> @end
+@implementation UILabel (ISMExport) @end
+
+@protocol ISMButtonExport <ISMViewExport>
+@property (readonly, copy) NSString *currentTitle;
+@end
+@interface UIButton (ISMExport) <ISMButtonExport> @end
+@implementation UIButton (ISMExport) @end
+
+@protocol ISMTextFieldExport <ISMViewExport>
+@property (nonatomic, copy) NSString *text;
+@property (nonatomic, copy) NSString *placeholder;
+@end
+@interface UITextField (ISMExport) <ISMTextFieldExport> @end
+@implementation UITextField (ISMExport) @end
+
+@protocol ISMTextViewExport <ISMViewExport>
+@property (nonatomic, copy) NSString *text;
+@end
+@interface UITextView (ISMExport) <ISMTextViewExport> @end
+@implementation UITextView (ISMExport) @end
+
+#pragma mark - JavaScriptCore eval bridge (Layer 2e)
+
+// A single persistent JSContext lives for the life of the host process. State
+// (variables, functions defined via eval_js) persists across calls so callers
+// can build up helper libraries interactively. eval_js_reset throws it away
+// and rebuilds with the same global bridges.
+//
+// Everything runs on the main queue: JS code can touch UIKit safely, and we
+// share the same main-thread discipline as view_tree / paste_text.
+
+static JSContext *ism_js_ctx = nil;
+
+// Forward decls used by bridged helpers below.
+static UIView *ism_find_view_by_ax_id(NSString *axId);
+static UIView *ism_find_view_by_class(NSString *clsName);
+static UIViewController *ism_find_vc_by_class(NSString *clsName);
+
+static void ism_install_js_bridges(JSContext *ctx) {
+    ctx[@"app"]         = UIApplication.sharedApplication;
+    ctx[@"defaults"]    = [NSUserDefaults standardUserDefaults];
+    ctx[@"pasteboard"]  = UIPasteboard.generalPasteboard;
+    ctx[@"bundle"]      = [NSBundle mainBundle];
+    ctx[@"process"]     = [NSProcessInfo processInfo];
+    ctx[@"notif_center"]= [NSNotificationCenter defaultCenter];
+
+    ctx[@"key_window"]       = ^UIWindow * () {
+        for (UIWindow *w in ism_all_windows()) if (w.isKeyWindow) return w;
+        return ism_all_windows().firstObject;
+    };
+    ctx[@"all_windows"]      = ^NSArray * () { return ism_all_windows(); };
+    ctx[@"first_responder"]  = ^id ()         { return ism_find_first_responder(); };
+
+    ctx[@"find_view_by_ax_id"] = ^UIView * (NSString *axId) { return ism_find_view_by_ax_id(axId); };
+    ctx[@"find_view_by_class"] = ^UIView * (NSString *cls)  { return ism_find_view_by_class(cls); };
+    ctx[@"find_vc_by_class"]   = ^UIViewController * (NSString *cls) { return ism_find_vc_by_class(cls); };
+
+    ctx[@"post_notification"] = ^(NSString *name, NSDictionary *userInfo) {
+        if (![name isKindOfClass:[NSString class]]) return;
+        [[NSNotificationCenter defaultCenter] postNotificationName:name
+                                                            object:nil
+                                                          userInfo:[userInfo isKindOfClass:[NSDictionary class]] ? userInfo : nil];
+    };
+
+    ctx[@"log"] = ^(JSValue *msg) {
+        os_log(ism_rpc_log(), "js: %{public}@", [msg toString]);
+    };
+
+    // Convenience: NSClassFromString in JS, e.g. cls("UILabel").
+    ctx[@"cls"] = ^Class (NSString *name) {
+        return NSClassFromString(name);
+    };
+}
+
+static JSContext *ism_get_js_context(void) {
+    __block JSContext *ctx = nil;
+    dispatch_sync(dispatch_get_main_queue(), ^{
+        if (!ism_js_ctx) {
+            ism_js_ctx = [[JSContext alloc] init];
+            ism_js_ctx.name = @"ios-sim-mcp-eval";
+            ism_js_ctx.exceptionHandler = ^(JSContext *c, JSValue *exception) {
+                os_log_error(ism_rpc_log(), "js exception: %{public}@", [exception toString]);
+                c.exception = exception;
+            };
+            ism_install_js_bridges(ism_js_ctx);
+        }
+        ctx = ism_js_ctx;
+    });
+    return ctx;
+}
+
+// Walk all windows once looking for the first UIView matching a predicate.
+static UIView *ism_find_view_helper(BOOL (^matches)(UIView *)) {
+    for (UIWindow *w in ism_all_windows()) {
+        NSMutableArray<UIView *> *stack = [NSMutableArray arrayWithObject:w];
+        while (stack.count > 0) {
+            UIView *v = stack.lastObject;
+            [stack removeLastObject];
+            if (matches(v)) return v;
+            for (UIView *sub in v.subviews) [stack addObject:sub];
+        }
+    }
+    return nil;
+}
+
+static UIView *ism_find_view_by_ax_id(NSString *axId) {
+    if (![axId isKindOfClass:[NSString class]] || axId.length == 0) return nil;
+    return ism_find_view_helper(^BOOL(UIView *v) {
+        return [v.accessibilityIdentifier isEqualToString:axId];
+    });
+}
+
+static UIView *ism_find_view_by_class(NSString *clsName) {
+    Class cls = NSClassFromString(clsName);
+    if (!cls) return nil;
+    return ism_find_view_helper(^BOOL(UIView *v) {
+        return [v isKindOfClass:cls];
+    });
+}
+
+static UIViewController *ism_find_vc_by_class(NSString *clsName) {
+    Class cls = NSClassFromString(clsName);
+    if (!cls) return nil;
+    for (UIWindow *w in ism_all_windows()) {
+        UIViewController *root = w.rootViewController;
+        NSMutableArray<UIViewController *> *q = [NSMutableArray arrayWithObject:root];
+        while (q.count > 0) {
+            UIViewController *vc = q.firstObject;
+            [q removeObjectAtIndex:0];
+            if ([vc isKindOfClass:cls]) return vc;
+            if (vc.presentedViewController) [q addObject:vc.presentedViewController];
+            [q addObjectsFromArray:vc.childViewControllers];
+        }
+    }
+    return nil;
+}
+
+// Convert a JSValue into a JSON-friendly NSObject, returning its "kind" too.
+// For ObjC-bridged objects (NSURL, UIView, etc.) we record class + description
+// rather than try to walk the object — the caller can dig deeper via eval_js.
+static NSDictionary *ism_coerce_js_value(JSValue *v) {
+    if (!v || v.isUndefined) return @{@"kind": @"undefined", @"value": [NSNull null]};
+    if (v.isNull)            return @{@"kind": @"null",      @"value": [NSNull null]};
+    if (v.isBoolean)         return @{@"kind": @"boolean",   @"value": @([v toBool])};
+    if (v.isNumber)          return @{@"kind": @"number",    @"value": @([v toDouble])};
+    if (v.isString)          return @{@"kind": @"string",    @"value": [v toString]};
+    if (v.isArray) {
+        id raw = [v toArray];
+        if (!raw) raw = @[];
+        if ([NSJSONSerialization isValidJSONObject:raw]) return @{@"kind": @"array", @"value": raw};
+        // ObjC objects inside; describe each.
+        NSMutableArray *out = [NSMutableArray array];
+        for (id e in raw) [out addObject:[NSString stringWithFormat:@"%@", e]];
+        return @{@"kind": @"array_described", @"value": out};
+    }
+    if (v.isObject) {
+        id raw = [v toObject];
+        if (raw == nil) return @{@"kind": @"object_null", @"value": [NSNull null]};
+        if ([NSJSONSerialization isValidJSONObject:raw]) {
+            return @{@"kind": @"object", @"value": raw};
+        }
+        // ObjC bridge — record class + description.
+        return @{
+            @"kind": @"objc",
+            @"class": NSStringFromClass([raw class]) ?: @"?",
+            @"description": [raw description] ?: @"",
+        };
+    }
+    return @{@"kind": @"other", @"value": [v toString] ?: @""};
 }
 
 #pragma mark - Network interception (Layer 2d)
@@ -1000,6 +1273,65 @@ static void ism_register_builtins(NSString *bundleId, NSString *processName, NSS
             [ism_net_lock unlock];
         }
         return @{@"cleared": @YES};
+    });
+
+    // -------- JS eval bridge (Layer 2e) --------
+
+    // eval_js: runs arbitrary JavaScript in a persistent JSContext bridged to
+    // app / key_window() / defaults / pasteboard / bundle / process plus
+    // helpers (find_view_by_ax_id, find_vc_by_class, post_notification, log,
+    // cls). State persists across calls; use eval_js_reset to clear.
+    //
+    // Return shape:
+    //   ok=true:  {kind, value} where kind ∈ string|number|boolean|null|
+    //             undefined|array|object|array_described|objc|other.
+    //             For "objc", also: class + description.
+    //   ok=false: {exception}.
+    // Plus: elapsed_ms.
+    ism_register_method(@"eval_js", ^NSDictionary *(NSDictionary *params) {
+        id codeVal = params[@"code"];
+        if (![codeVal isKindOfClass:[NSString class]]) {
+            @throw [NSException exceptionWithName:@"BadParams"
+                                           reason:@"`code` must be a string"
+                                         userInfo:nil];
+        }
+        NSString *code = codeVal;
+
+        JSContext *ctx = ism_get_js_context();
+        __block JSValue *result = nil;
+        __block NSString *exception = nil;
+        NSDate *startedAt = [NSDate date];
+
+        dispatch_sync(dispatch_get_main_queue(), ^{
+            ctx.exception = nil;
+            result = [ctx evaluateScript:code];
+            if (ctx.exception) {
+                exception = [ctx.exception toString];
+                ctx.exception = nil;
+            }
+        });
+
+        NSTimeInterval elapsed = -[startedAt timeIntervalSinceNow];
+
+        if (exception) {
+            return @{
+                @"ok": @NO,
+                @"exception": exception,
+                @"elapsed_ms": @((long long)(elapsed * 1000.0)),
+            };
+        }
+        NSDictionary *coerced = ism_coerce_js_value(result);
+        NSMutableDictionary *out = [coerced mutableCopy];
+        out[@"ok"] = @YES;
+        out[@"elapsed_ms"] = @((long long)(elapsed * 1000.0));
+        return out;
+    });
+
+    ism_register_method(@"eval_js_reset", ^NSDictionary *(NSDictionary *params) {
+        dispatch_sync(dispatch_get_main_queue(), ^{
+            ism_js_ctx = nil; // lazily recreated on next eval_js
+        });
+        return @{@"reset": @YES};
     });
 
     // network_self_test: verifies the interception path end-to-end by firing

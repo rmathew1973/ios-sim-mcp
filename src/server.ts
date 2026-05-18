@@ -466,6 +466,37 @@ server.registerTool("view_hit_test", {
   } catch (e) { return err(e); }
 });
 
+// -------- Layer 2e JavaScript eval bridge --------
+
+server.registerTool("eval_js", {
+  description: "Run arbitrary JavaScript inside the injected app via JavaScriptCore. Bridged globals: `app` (UIApplication), `key_window()`, `all_windows()`, `defaults` (NSUserDefaults), `pasteboard` (UIPasteboard), `bundle`, `process`, `notif_center`, `first_responder()`, `find_view_by_ax_id(id)`, `find_view_by_class(name)`, `find_vc_by_class(name)`, `post_notification(name, userInfo?)`, `cls(name)` (NSClassFromString), `log(msg)`. JS state PERSISTS across calls — define functions/vars in one call, use them in the next. eval_js_reset throws the context away. For ObjC-bridged return values you get {class, description}; for JSON-able returns you get the actual value.",
+  inputSchema: {
+    code: z.string(),
+    bundle_id: z.string().optional(),
+    timeout_ms: z.number().int().positive().optional(),
+  },
+}, async ({ code, bundle_id, timeout_ms }) => {
+  try {
+    const client = await getDylibClient(bundle_id);
+    const r: any = await client.call("eval_js", { code }, { timeoutMs: timeout_ms });
+    const head = `[${r.elapsed_ms}ms] ${r.ok ? "ok" : "EXCEPTION"}  kind=${r.kind ?? "—"}`;
+    if (!r.ok) return txt(`${head}\n${r.exception}`);
+    if (r.kind === "objc") return txt(`${head}\n<${r.class}: ${r.description}>`);
+    return txt(`${head}\n${JSON.stringify(r.value, null, 2)}`);
+  } catch (e) { return err(e); }
+});
+
+server.registerTool("eval_js_reset", {
+  description: "Drop the persistent JSContext inside the injected app. Variables and helper functions you defined via eval_js are forgotten; bridged globals are reinstalled on the next eval_js call.",
+  inputSchema: { bundle_id: z.string().optional() },
+}, async ({ bundle_id }) => {
+  try {
+    const client = await getDylibClient(bundle_id);
+    const r = await client.call("eval_js_reset", {});
+    return txt(JSON.stringify(r, null, 2));
+  } catch (e) { return err(e); }
+});
+
 // -------- Layer 2d network interception --------
 
 server.registerTool("network_start", {

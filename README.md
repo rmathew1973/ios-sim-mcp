@@ -21,7 +21,7 @@ Three layers, two shipping today:
 | 2b — In-process RPC | ✅ shipping | Unix socket + JSON-Lines | round-trip into a running app at **~1ms per call** |
 | 2c — View introspection | ✅ shipping | Main-thread UIView walk | `view_tree`, `view_hit_test` — class hierarchy, frames, responder chains, VC annotations |
 | 2d — Network interception | ✅ shipping | `URLProtocol` + `URLSessionConfiguration` swizzle | capture every HTTP request/response (headers, bodies, timing) inside the app — no cert install, no mitmproxy |
-| 2e — JS eval | 🚧 next | `JSContext` | `eval_js({code})` against the running app |
+| 2e — JS eval | ✅ shipping | `JSContext` + `JSExport` bridges | `eval_js({code})` with `app` / `key_window()` / `defaults` / `pasteboard` / `bundle` / `process` / view-finder helpers — Chrome's `Runtime.evaluate` equivalent |
 | 3 — System logs | ✅ shipping | `xcrun simctl spawn log stream` | streaming os_log into a 5000-line ring buffer |
 
 `idb` talks directly to CoreSimulator's private framework — no WebDriverAgent, no HTTP hop into the simulator process — which is why the per-call latency is closer to a local subprocess than to a network round trip.
@@ -94,6 +94,8 @@ It's a standard stdio MCP server. Run `bun run src/server.ts` and pipe JSON-RPC.
 | `network_get_body` | Fetch the full request or response body (up to `max_body_bytes`, default 256KB) for a specific record id. Returns base64 + UTF-8 decode for text bodies |
 | `network_clear` | Drop the ring buffer and all retained bodies |
 | `network_self_test` | Fire an HTTP request from inside the app to verify the capture path end-to-end |
+| `eval_js` | Run arbitrary JavaScript in a persistent `JSContext` inside the injected app. Bridged globals: `app`, `key_window()`, `all_windows()`, `defaults`, `pasteboard`, `bundle`, `process`, `notif_center`, `first_responder()`, `find_view_by_ax_id`, `find_view_by_class`, `find_vc_by_class`, `post_notification`, `cls`, `log`. State persists across calls. Requires dylib injected |
+| `eval_js_reset` | Drop the JSContext and rebuild bridges on next eval — forgets your defined vars/fns |
 | `key` | Press a key by name (RETURN, ESC, DELETE, TAB, SPACE, F1–F12, arrows) or raw HID code |
 | `button` | Hardware button: HOME, LOCK, SIDE_BUTTON, SIRI, APPLE_PAY |
 | `swipe` | Swipe between two refs/ids/points. Optional `duration` and `delta` |
@@ -231,12 +233,57 @@ network_get_body({ id: 34, which: "response" })  // full body if it was truncate
 - ⚠️ `HTTPBodyStream` request bodies are noted but not captured (would require draining + rewinding the stream)
 - ⚠️ Sessions constructed *before* `network_start` are not retro-fitted; restart the app or relaunch with `inject:true` if you need to catch app-startup traffic
 
+## Scripting the running app (Layer 2e)
+
+```ts
+launch_app({ bundle_id: "com.yourco.app", inject: true })
+
+eval_js({ code: "bundle.bundleIdentifier" })
+// → "com.yourco.app"
+
+eval_js({ code: "app.windows[0].rootViewController.title || 'untitled'" })
+// → "Home"
+
+// Toggle a feature flag stored in NSUserDefaults
+eval_js({ code: "defaults.setBoolForKey(true, 'feature.dark_mode'); 'set'" })
+
+// Inspect or mutate a live view
+eval_js({ code: "var v = find_view_by_class('UITextField'); v && (v.text = 'qa@example.com')" })
+
+// Define a helper, use it later — state persists across calls
+eval_js({ code: "function visibleWindows(){return all_windows().filter(w => !w.isHidden && w.alpha > 0.01);}" })
+eval_js({ code: "visibleWindows().length" })
+// → 1
+```
+
+Bridged globals (all installed automatically on first `eval_js`):
+
+| Global | Type | Use |
+|---|---|---|
+| `app` | UIApplication | `app.windows`, `app.applicationState` |
+| `key_window()` | → UIWindow | most-foreground window |
+| `all_windows()` | → [UIWindow] | every window across all scenes |
+| `defaults` | NSUserDefaults | `stringForKey`, `setObjectForKey`, etc. |
+| `pasteboard` | UIPasteboard | `string` getter/setter |
+| `bundle` | NSBundle | `bundleIdentifier`, `infoDictionary` |
+| `process` | NSProcessInfo | `processName`, `environment`, `processIdentifier` |
+| `notif_center` | NSNotificationCenter | |
+| `first_responder()` | → UIResponder | currently focused responder |
+| `find_view_by_ax_id(id)` | → UIView \| null | quick view lookup |
+| `find_view_by_class(name)` | → UIView \| null | first-match by class name |
+| `find_vc_by_class(name)` | → UIViewController \| null | walks rootVC → presented + children |
+| `post_notification(name, userInfo?)` | → void | fire an NSNotification |
+| `cls(name)` | → Class | `NSClassFromString` shortcut |
+| `log(msg)` | → void | writes to os_log (visible via `log_tail`) |
+
+JSC's `JSExport` is implemented on UIView, UIWindow, UIViewController, UILabel, UIButton, UITextField, UITextView, UIApplication, NSBundle, NSProcessInfo, NSUserDefaults, UIPasteboard so common property access and method calls work without further bridging. Selector colons become camelCase function names: `setObject:forKey:` → `setObjectForKey(value, key)`.
+
 ## Roadmap
 
-- **Layer 2e** — `JSContext` bridge: `eval_js({code})` against a running app.
 - **`describe_point`** — "what's under (x,y)?" for debugging gesture targets.
 - **Video recording** — wrap `idb record-video` as `record_start`/`record_stop`.
 - **Multi-sim parallelism** — share one server across multiple booted devices for matrix testing.
+- **JS interactive REPL tool** — multi-line buffer with history, useful for ad-hoc exploration.
 
 ## License
 

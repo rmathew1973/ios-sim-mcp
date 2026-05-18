@@ -28,6 +28,7 @@ build_slice() {
         -install_name "@rpath/$OUT_NAME" \
         -framework Foundation \
         -framework UIKit \
+        -framework JavaScriptCore \
         -o "$out" \
         "$SRC"
 }
