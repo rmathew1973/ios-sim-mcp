@@ -22,6 +22,7 @@
 //   - UIKit touches must dispatch_sync(dispatch_get_main_queue(), ...) (n/a in 2b).
 
 #import <Foundation/Foundation.h>
+#import <UIKit/UIKit.h>
 #import <os/log.h>
 #include <unistd.h>
 #include <errno.h>
@@ -248,6 +249,51 @@ static BOOL ism_start_server(NSString *path) {
     return YES;
 }
 
+#pragma mark - UIKit helpers (main-thread only)
+
+static UIResponder *ism_find_first_responder_in_view(UIView *view) {
+    if ([view isFirstResponder]) return view;
+    for (UIView *sub in view.subviews) {
+        UIResponder *r = ism_find_first_responder_in_view(sub);
+        if (r) return r;
+    }
+    return nil;
+}
+
+static NSArray<UIWindow *> *ism_all_windows(void) {
+    NSMutableArray<UIWindow *> *out = [NSMutableArray array];
+    if (@available(iOS 13.0, *)) {
+        for (UIScene *scene in UIApplication.sharedApplication.connectedScenes) {
+            if ([scene isKindOfClass:[UIWindowScene class]]) {
+                [out addObjectsFromArray:((UIWindowScene *)scene).windows];
+            }
+        }
+    }
+    // Pre-13 fallback / belt-and-suspenders. Some apps still vend non-scene windows.
+    #pragma clang diagnostic push
+    #pragma clang diagnostic ignored "-Wdeprecated-declarations"
+    NSArray<UIWindow *> *legacy = UIApplication.sharedApplication.windows;
+    #pragma clang diagnostic pop
+    for (UIWindow *w in legacy) if (![out containsObject:w]) [out addObject:w];
+    return out;
+}
+
+static UIResponder *ism_find_first_responder(void) {
+    NSArray<UIWindow *> *windows = ism_all_windows();
+    // Prefer the key window — that's where focus actually lives.
+    for (UIWindow *w in windows) {
+        if (w.isKeyWindow) {
+            UIResponder *r = ism_find_first_responder_in_view(w);
+            if (r) return r;
+        }
+    }
+    for (UIWindow *w in windows) {
+        UIResponder *r = ism_find_first_responder_in_view(w);
+        if (r) return r;
+    }
+    return nil;
+}
+
 #pragma mark - Builtin methods
 
 static void ism_register_builtins(NSString *bundleId, NSString *processName, NSString *bundlePath) {
@@ -271,6 +317,61 @@ static void ism_register_builtins(NSString *bundleId, NSString *processName, NSS
             @"uptime_s": @([[NSDate date] timeIntervalSinceDate:startedAt]),
             @"phase": @"2b",
             @"methods": ism_method_names(),
+        };
+    });
+
+    // paste_text: byte-perfect text input via UIPasteboard + first responder's
+    // -paste:. Bypasses iOS keyboard entirely — no autocorrect, no first-letter
+    // capitalization, no shifted-symbol HID translation. The MCP's type_text
+    // tool auto-routes here when the dylib is loaded.
+    //
+    // Pre-condition: a text field must already be the first responder (i.e.
+    // caller tapped the field first). If not, returns a clear error.
+    ism_register_method(@"paste_text", ^NSDictionary *(NSDictionary *params) {
+        id textRaw = params[@"text"];
+        if (![textRaw isKindOfClass:[NSString class]]) {
+            @throw [NSException exceptionWithName:@"BadParams"
+                                           reason:@"`text` must be a string"
+                                         userInfo:nil];
+        }
+        NSString *text = textRaw;
+
+        __block BOOL ok = NO;
+        __block NSString *errMsg = nil;
+        __block NSString *responderClass = nil;
+
+        dispatch_sync(dispatch_get_main_queue(), ^{
+            @try {
+                UIPasteboard.generalPasteboard.string = text;
+                UIResponder *responder = ism_find_first_responder();
+                if (!responder) {
+                    errMsg = @"no first responder — tap a text field before paste_text";
+                    return;
+                }
+                responderClass = NSStringFromClass([responder class]);
+                SEL pasteSel = @selector(paste:);
+                if (![responder respondsToSelector:pasteSel]) {
+                    errMsg = [NSString stringWithFormat:@"responder %@ does not implement paste:", responderClass];
+                    return;
+                }
+                #pragma clang diagnostic push
+                #pragma clang diagnostic ignored "-Warc-performSelector-leaks"
+                [responder performSelector:pasteSel withObject:nil];
+                #pragma clang diagnostic pop
+                ok = YES;
+            } @catch (NSException *e) {
+                errMsg = [NSString stringWithFormat:@"%@: %@", e.name, e.reason];
+            }
+        });
+
+        if (!ok) {
+            @throw [NSException exceptionWithName:@"PasteFailed"
+                                           reason:errMsg ?: @"unknown error"
+                                         userInfo:nil];
+        }
+        return @{
+            @"chars": @(text.length),
+            @"responder": responderClass ?: @"",
         };
     });
 }

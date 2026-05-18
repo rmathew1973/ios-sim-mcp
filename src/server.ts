@@ -168,13 +168,15 @@ server.registerTool("tap", {
 });
 
 server.registerTool("type_text", {
-  description: "Type text via the simulator keyboard. By default the currently focused field receives it. Pass ref/id to tap a field first, then type. Newlines/tabs aren't interpreted — use the key tool for RETURN/TAB. If you type and nothing visibly changes, the field probably wasn't focused: tap it then re-snapshot.",
+  description: "Type text into the focused field. Pass ref/id to tap a field first. Newlines/tabs aren't interpreted — use the key tool for RETURN/TAB. via='paste' (default 'auto') routes through the Layer 2 dylib's UIPasteboard so input arrives byte-perfect: no iOS autocorrect, no first-letter capitalization, no shifted-symbol translation — critical for emails, passwords, anything case-sensitive. 'auto' uses paste when the bundle has a connected dylib client, otherwise falls back to keystrokes. 'keystroke' forces idb's text command (typing-like, triggers autocorrect).",
   inputSchema: {
     text: z.string(),
     ref: z.string().optional(),
     id: z.string().optional(),
+    via: z.enum(["auto", "paste", "keystroke"]).optional(),
+    bundle_id: z.string().optional(),
   },
-}, async ({ text, ref, id }) => {
+}, async ({ text, ref, id, via, bundle_id }) => {
   try {
     const udid = await ensureUdid();
     if (ref || id) {
@@ -182,8 +184,56 @@ server.registerTool("type_text", {
       await actions.tapPoint(udid, t.x, t.y);
       await new Promise(r => setTimeout(r, 200));
     }
-    await actions.typeText(udid, text);
-    return txt(`typed ${text.length} chars${ref || id ? ` into ${ref ?? id}` : ""}`);
+
+    const mode = via ?? "auto";
+    const candidateBundle = bundle_id ?? state.lastInjectedBundleId ?? undefined;
+    const dylibAvailable = !!candidateBundle && state.dylibClients.has(candidateBundle);
+
+    let usedPath: "paste" | "keystroke";
+    if (mode === "paste") {
+      const client = await getDylibClient(candidateBundle);
+      await client.call("paste_text", { text });
+      usedPath = "paste";
+    } else if (mode === "auto" && dylibAvailable) {
+      try {
+        const client = await getDylibClient(candidateBundle);
+        await client.call("paste_text", { text });
+        usedPath = "paste";
+      } catch (pasteErr) {
+        // Common reason: no first responder (focus was lost). Fall back so the
+        // caller still gets characters into the field instead of a hard error.
+        await actions.typeText(udid, text);
+        usedPath = "keystroke";
+        const msg = pasteErr instanceof Error ? pasteErr.message : String(pasteErr);
+        return txt(`typed ${text.length} chars${ref || id ? ` into ${ref ?? id}` : ""} via keystroke (paste fell back: ${msg})`);
+      }
+    } else {
+      await actions.typeText(udid, text);
+      usedPath = "keystroke";
+    }
+    return txt(`typed ${text.length} chars${ref || id ? ` into ${ref ?? id}` : ""} via ${usedPath}`);
+  } catch (e) { return err(e); }
+});
+
+server.registerTool("paste_text", {
+  description: "Byte-perfect text input via UIPasteboard + first-responder paste:. Requires the Layer 2 dylib injected and a text field already focused (call tap first). No iOS autocorrect, no capitalization, no smart-quote replacement — what you pass is exactly what the field receives. Use for emails, passwords, OAuth tokens, anything case-sensitive.",
+  inputSchema: {
+    text: z.string(),
+    bundle_id: z.string().optional(),
+    ref: z.string().optional(),
+    id: z.string().optional(),
+  },
+}, async ({ text, bundle_id, ref, id }) => {
+  try {
+    const udid = await ensureUdid();
+    if (ref || id) {
+      const t = resolveTarget({ ref, id });
+      await actions.tapPoint(udid, t.x, t.y);
+      await new Promise(r => setTimeout(r, 200));
+    }
+    const client = await getDylibClient(bundle_id);
+    const result = await client.call("paste_text", { text });
+    return txt(`pasted ${text.length} chars${ref || id ? ` into ${ref ?? id}` : ""} (responder=${result.responder})`);
   } catch (e) { return err(e); }
 });
 

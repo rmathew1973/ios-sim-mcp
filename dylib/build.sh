@@ -27,6 +27,7 @@ build_slice() {
         -O2 \
         -install_name "@rpath/$OUT_NAME" \
         -framework Foundation \
+        -framework UIKit \
         -o "$out" \
         "$SRC"
 }

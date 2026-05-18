@@ -83,7 +83,8 @@ It's a standard stdio MCP server. Run `bun run src/server.ts` and pipe JSON-RPC.
 | `snapshot` | Capture the AX tree, assign refs `e1..eN`, return compact text rendering. Filters: `interactive` (default), `actionable`, `all` |
 | `find` | Search the snapshot by `id` (AXUniqueId), `label`, `labelContains`, `role`, `actionable` |
 | `tap` | Tap by `{ref}`, `{id}`, or `{x,y}`. Optional `duration` makes it a long-press |
-| `type_text` | Type into the focused field. Optional `{ref}` or `{id}` taps-then-types |
+| `type_text` | Type into the focused field. Optional `{ref}` or `{id}` taps-then-types. Auto-routes through paste when the dylib is loaded for byte-perfect input — no iOS autocorrect, no first-letter capitalization. `via: "keystroke"` forces the typing path; `via: "paste"` forces the paste path |
+| `paste_text` | Byte-perfect text via `UIPasteboard` + first-responder `paste:`. Requires the dylib injected. The right answer for emails, passwords, OAuth tokens, anything case-sensitive |
 | `key` | Press a key by name (RETURN, ESC, DELETE, TAB, SPACE, F1–F12, arrows) or raw HID code |
 | `button` | Hardware button: HOME, LOCK, SIDE_BUTTON, SIRI, APPLE_PAY |
 | `swipe` | Swipe between two refs/ids/points. Optional `duration` and `delta` |
@@ -157,6 +158,16 @@ dylib_call({ method: "...", params }) // generic; future phases register more me
 ```
 
 Once connected, IPC is **sub-millisecond per call** — orders of magnitude cheaper than Layer 1's subprocess-spawn overhead. Connection is lazy (first `dylib_*` call) and pooled per bundle id; relaunch invalidates the old client automatically.
+
+### Why you want to launch with `inject: true` even for casual driving
+
+iOS auto-capitalizes the first letter of typed input, swaps `"` `'` for smart-quotes, and runs autocorrect on anything that looks like a word. For driving UI those transformations silently mangle:
+
+- `qa-consumer2@geoland.test` becomes `Qa-consumer2@geoland.test` → **server rejects the email** → login fails with no obvious cause
+- `café` becomes nothing iOS can even render → field receives garbage
+- `a"b'c` becomes `A` after smart-quote substitution and autocorrect
+
+With the dylib loaded, `type_text` auto-routes through `UIPasteboard.general.string = text` + the first responder's `paste:`. Bypasses the keyboard entirely. Whatever you pass arrives byte-perfect.
 
 Build it once:
 
