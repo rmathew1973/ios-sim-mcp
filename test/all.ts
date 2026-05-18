@@ -30,6 +30,7 @@ const TESTS: TestSpec[] = [
   { file: "eval_js.ts",        label: "Layer 2e — JavaScriptCore eval bridge",    needsDylib: true },
   { file: "network_stubs.ts",  label: "Layer 2f — HTTP stubbing (canned responses)", needsDylib: true, needsInternet: true },
   { file: "productionize.ts",  label: "Productionization — universal dylib, health, crash safety", needsDylib: true },
+  { file: "swizzle_idempotent.ts", label: "Swizzle chain — idempotent start, no recursion", needsDylib: true, needsInternet: true },
 ];
 
 const DYLIB_PATH = path.resolve(import.meta.dir, "../dylib/build/libios-sim-mcp.dylib");

@@ -891,6 +891,25 @@ didCompleteWithError:(NSError *)error {
 @end
 
 // Swizzles for default + ephemeral configs ----------------------------------
+//
+// Chain behavior with other tools that swizzle the same selectors (Reactotron,
+// Bagel, Atlantis, Pulse, in-house network debuggers):
+//   - If they swizzled BEFORE us: method_getImplementation captures *their*
+//     swizzle as ism_orig_*Config_imp. Our swizzle then calls it via the
+//     stashed function pointer — their interceptor still runs, then we add
+//     ourselves to the returned config's protocolClasses. They coexist.
+//   - If they swizzle AFTER us: they capture *our* swizzle as their "original"
+//     and chain back to us. Same cooperative result.
+//
+// Two failure modes to be aware of (neither preventable from inside one dylib):
+//   1. A tool that *replaces* protocolClasses wholesale (rather than appending)
+//      will silently remove us from new configs. There's no reliable defense
+//      short of repeatedly re-installing on every config creation.
+//   2. Multiple swizzlers that all use insertObject:atIndex:0 race for "first
+//      dibs" on a given request; +canInitWithRequest order is essentially
+//      load-order-determined. In practice URLProtocol-based tools are mutually
+//      exclusive per request (first non-NO wins), so the conflict is "who
+//      sees this request" not "does it work" — both would still observe it.
 
 static NSURLSessionConfiguration *ism_swizzled_default(Class self, SEL _cmd) {
     NSURLSessionConfiguration *c = ((NSURLSessionConfiguration *(*)(Class, SEL))ism_orig_defaultConfig_imp)(self, _cmd);
@@ -1709,8 +1728,15 @@ static void ios_sim_mcp_init(void) {
         os_log(log, "ios-sim-mcp dylib loaded pid=%d process=%{public}@ bundle=%{public}@",
                pid, processName, bundleId);
 
+        // App extensions, XPC helpers, and certain plugin-host processes load
+        // with [NSBundle mainBundle].bundleIdentifier == nil or "". Skip socket
+        // binding for those — they almost always shouldn't be exposed via the
+        // MCP, and the path collision would interfere with the main app's
+        // socket at /tmp/ios-sim-mcp-<bundle>.sock anyway. If you genuinely
+        // want to drive an extension, launch IT with inject:true directly;
+        // its real bundle id will route to a distinct socket path.
         if (bundleId.length == 0) {
-            os_log_error(log, "no bundle id; skipping socket server (likely a helper process)");
+            os_log_error(log, "no bundle id; skipping socket server (likely a helper / extension process)");
             return;
         }
 

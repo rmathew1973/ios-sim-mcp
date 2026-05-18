@@ -333,6 +333,28 @@ Bridged globals (all installed automatically on first `eval_js`):
 
 JSC's `JSExport` is implemented on UIView, UIWindow, UIViewController, UILabel, UIButton, UITextField, UITextView, UIApplication, NSBundle, NSProcessInfo, NSUserDefaults, UIPasteboard so common property access and method calls work without further bridging. Selector colons become camelCase function names: `setObject:forKey:` → `setObjectForKey(value, key)`.
 
+## App extensions, helpers, plugin hosts
+
+`SIMCTL_CHILD_DYLD_INSERT_LIBRARIES` only affects the process `simctl` directly launches — not SpringBoard, not Mediaserverd, not other system daemons. Within your app's *own* sub-processes (XPC helpers, app extensions launched on demand: share, action, today widget), the dylib will load if `dyld` honors the env var. To keep things sane:
+
+- If a loaded process has `[NSBundle mainBundle].bundleIdentifier` empty or nil (XPC helpers, certain plugin hosts), the dylib **silently skips socket binding** — no MCP exposure, no `/tmp/ios-sim-mcp-*.sock` path collision with the main app.
+- If a loaded process is a real app extension with its own bundle id (e.g. `com.yourco.app.ShareExtension`), the dylib opens a **distinct socket** at `/tmp/ios-sim-mcp-<extension-bundle-id>.sock`. You can drive the extension independently by passing that bundle id to `dylib_*` tools.
+- In normal flows you only `launch_app` your main app. Extensions launched by iOS during a share/widget interaction are technically reachable but not normally targeted — set `bundle_id` explicitly on every tool call when you want one.
+
+## Distribution model — why runtime injection, not SwiftPM
+
+We ship Option 1: prebuilt universal dylib, injected at runtime via `DYLD_INSERT_LIBRARIES`. Devs add **nothing** to their Xcode project — no SPM dep, no build setting, no `#if DEBUG` guard. The dylib physically isn't part of their app, so App Store submission and production builds are unaffected.
+
+The alternatives we considered:
+
+| Option | What it'd unlock | What it costs |
+|---|---|---|
+| **1. Runtime DYLD inject** (current) | Zero integration. Works on any sim build. App Store untouched. | Limited to public + JSExport-bridged ObjC. No access to `internal` Swift types. |
+| 2. SwiftPM dev-dependency | `@testable` import → access to your app's internal types. Compile-time `#if DEBUG` enforcement. Custom hooks at app-defined seams. | Devs add a package, gate it behind `#if DEBUG`, accept some compile-time hit on test builds. |
+| 3. Both | Best of both for devs who want it. | Twice the surface to maintain. |
+
+Option 1 covers the 90% case (driving any iOS sim with no project changes), so we shipped it first. Option 2/3 are reasonable future additions if a user team specifically wants to introspect their own Swift internals.
+
 ## Safety & production posture
 
 The Layer 2 dylib is engineered to **never crash the host app**:

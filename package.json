@@ -1,6 +1,6 @@
 {
   "name": "ios-sim-mcp",
-  "version": "0.4.0",
+  "version": "0.4.1",
   "description": "MCP server that drives the iOS Simulator via semantic accessibility-tree snapshots with stable refs. Includes an injectable dylib for in-process view introspection, HTTP capture, JavaScript eval, and byte-perfect text input. Chrome-DevTools-quality DX for iOS.",
   "type": "module",
   "module": "src/server.ts",
