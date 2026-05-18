@@ -22,6 +22,7 @@ Three layers, two shipping today:
 | 2c — View introspection | ✅ shipping | Main-thread UIView walk | `view_tree`, `view_hit_test` — class hierarchy, frames, responder chains, VC annotations |
 | 2d — Network interception | ✅ shipping | `URLProtocol` + `URLSessionConfiguration` swizzle | capture every HTTP request/response (headers, bodies, timing) inside the app — no cert install, no mitmproxy |
 | 2e — JS eval | ✅ shipping | `JSContext` + `JSExport` bridges | `eval_js({code})` with `app` / `key_window()` / `defaults` / `pasteboard` / `bundle` / `process` / view-finder helpers — Chrome's `Runtime.evaluate` equivalent |
+| 2f — Network stubbing | ✅ shipping | Same URLProtocol, synthesized response | register canned responses by URL substring + optional method; supports custom status/headers/body + `delay_ms` for slow-network simulation |
 | 3 — System logs | ✅ shipping | `xcrun simctl spawn log stream` | streaming os_log into a 5000-line ring buffer |
 
 `idb` talks directly to CoreSimulator's private framework — no WebDriverAgent, no HTTP hop into the simulator process — which is why the per-call latency is closer to a local subprocess than to a network round trip.
@@ -117,6 +118,7 @@ It's a standard stdio MCP server. Run `bun run src/server.ts` and pipe JSON-RPC.
 | `network_get_body` | Fetch the full request or response body (up to `max_body_bytes`, default 256KB) for a specific record id. Returns base64 + UTF-8 decode for text bodies |
 | `network_clear` | Drop the ring buffer and all retained bodies |
 | `network_self_test` | Fire an HTTP request from inside the app to verify the capture path end-to-end |
+| `network_stub` / `network_stubs` / `network_unstub` / `network_unstub_all` | Register canned HTTP responses by URL substring (+ optional method). Synthesizes status/headers/body without forwarding; `delay_ms` simulates slow networks. Stubbed requests still appear in `network_tail` with `stubbed:true` |
 | `eval_js` | Run arbitrary JavaScript in a persistent `JSContext` inside the injected app. Bridged globals: `app`, `key_window()`, `all_windows()`, `defaults`, `pasteboard`, `bundle`, `process`, `notif_center`, `first_responder()`, `find_view_by_ax_id`, `find_view_by_class`, `find_vc_by_class`, `post_notification`, `cls`, `log`. State persists across calls. Requires dylib injected |
 | `eval_js_reset` | Drop the JSContext and rebuild bridges on next eval — forgets your defined vars/fns |
 | `key` | Press a key by name (RETURN, ESC, DELETE, TAB, SPACE, F1–F12, arrows) or raw HID code |
@@ -255,6 +257,36 @@ network_get_body({ id: 34, which: "response" })  // full body if it was truncate
 - ⚠️ Does NOT catch: raw `CFNetwork` / `nw_connection_t` (low-level networking written against the BSD socket layer), background `URLSession`s, gRPC libraries that bypass URLSession, `WKWebView` resource loads (separate process)
 - ⚠️ `HTTPBodyStream` request bodies are noted but not captured (would require draining + rewinding the stream)
 - ⚠️ Sessions constructed *before* `network_start` are not retro-fitted; restart the app or relaunch with `inject:true` if you need to catch app-startup traffic
+
+## Network stubbing (Layer 2f)
+
+Register canned responses for any URL substring; the dylib synthesizes the response instead of forwarding. Unlocks deterministic error-path and slow-network testing without touching the backend.
+
+```ts
+// Force a 401 for the next login attempt
+network_stub({
+  url_substring: "/api/auth/login",
+  method: "POST",
+  status: 401,
+  headers: { "Content-Type": "application/json" },
+  body: '{"error":"invalid_credentials"}',
+})
+
+// Simulate slow API for offline-UX testing — 3 second delay
+network_stub({
+  url_substring: "/api/products",
+  delay_ms: 3000,
+  status: 200,
+  body: '[{"sku":"FAKE","name":"Stub Product"}]',
+})
+
+// Now drive the app — login fails as if password was wrong; product list spinner shows
+network_stubs()       // list active stubs
+network_unstub({id})  // remove one
+network_unstub_all()  // clear them all
+```
+
+Stubbed requests still appear in `network_tail` with `stubbed:true` and the matching `stub_id`, so you can verify the app sent what you expected before the synthesized response.
 
 ## Scripting the running app (Layer 2e)
 

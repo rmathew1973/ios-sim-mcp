@@ -631,6 +631,66 @@ server.registerTool("network_clear", {
   } catch (e) { return err(e); }
 });
 
+server.registerTool("network_stub", {
+  description: "Register an HTTP stub. When an outgoing request's URL contains `url_substring` (and matches `method` if given), the dylib synthesizes a canned response (status, headers, body) instead of forwarding. Stubbed requests still appear in network_tail with `stubbed:true` and `stub_id`. First-match-wins by insertion order. `body` is a UTF-8 string; pass `body_base64` for binary. `delay_ms` simulates slow networks (response is held back that long before client sees it). Persists until network_unstub / network_unstub_all.",
+  inputSchema: {
+    bundle_id: z.string().optional(),
+    url_substring: z.string(),
+    method: z.string().optional(),
+    status: z.number().int().optional(),
+    headers: z.record(z.string()).optional(),
+    body: z.string().optional(),
+    body_base64: z.string().optional(),
+    delay_ms: z.number().nonnegative().optional(),
+  },
+}, async ({ bundle_id, url_substring, method, status, headers, body, body_base64, delay_ms }) => {
+  try {
+    const client = await getDylibClient(bundle_id);
+    const r = await client.call("network_stub_add", { url_substring, method, status, headers, body, body_base64, delay_ms });
+    return txt(JSON.stringify(r, null, 2));
+  } catch (e) { return err(e); }
+});
+
+server.registerTool("network_stubs", {
+  description: "List currently registered HTTP stubs (id, url_substring, method filter, status, body preview, delay, when added). Raw body bytes are not returned — call network_get_body on a captured record if you need the actual body delivered.",
+  inputSchema: { bundle_id: z.string().optional() },
+}, async ({ bundle_id }) => {
+  try {
+    const client = await getDylibClient(bundle_id);
+    const r: any = await client.call("network_stub_list", {});
+    if (r.count === 0) return txt("(no stubs registered)");
+    const lines = r.stubs.map((s: any) => {
+      const m = s.method ? s.method : "ANY";
+      const delay = s.delay_ms > 0 ? ` +${s.delay_ms}ms` : "";
+      const preview = s.body_preview ? ` body=${JSON.stringify(String(s.body_preview).slice(0, 60))}` : "";
+      return `#${s.id} ${m} ${s.status}${delay}  url~"${s.url_substring}"${preview}`;
+    });
+    return txt(`${r.count} stub(s):\n${lines.join("\n")}`);
+  } catch (e) { return err(e); }
+});
+
+server.registerTool("network_unstub", {
+  description: "Remove a single HTTP stub by id (as returned from network_stub / network_stubs).",
+  inputSchema: { id: z.number().int().positive(), bundle_id: z.string().optional() },
+}, async ({ id, bundle_id }) => {
+  try {
+    const client = await getDylibClient(bundle_id);
+    const r = await client.call("network_stub_remove", { id });
+    return txt(JSON.stringify(r, null, 2));
+  } catch (e) { return err(e); }
+});
+
+server.registerTool("network_unstub_all", {
+  description: "Remove all HTTP stubs.",
+  inputSchema: { bundle_id: z.string().optional() },
+}, async ({ bundle_id }) => {
+  try {
+    const client = await getDylibClient(bundle_id);
+    const r: any = await client.call("network_stub_clear", {});
+    return txt(`cleared ${r.cleared} stub(s)`);
+  } catch (e) { return err(e); }
+});
+
 server.registerTool("network_self_test", {
   description: "Fire a real HTTP request from inside the injected app to validate the capture path end-to-end. Useful when the host app makes no network calls of its own during a smoke test. Requires network_start first.",
   inputSchema: {

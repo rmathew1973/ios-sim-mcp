@@ -626,6 +626,46 @@ static BOOL ism_url_passes_filter(NSURL *url) {
     return [url.absoluteString rangeOfString:ism_net_url_filter options:NSCaseInsensitiveSearch].location != NSNotFound;
 }
 
+// Stub registry (Phase 2f) ---------------------------------------------------
+// First-match-wins by insertion order. A matching stub causes the URLProtocol
+// to synthesize a canned response instead of forwarding the request.
+
+static NSMutableArray<NSMutableDictionary *> *ism_net_stubs = nil;
+static NSLock                                 *ism_net_stubs_lock = nil;
+static int64_t                                 ism_net_next_stub_id = 0;
+
+static NSDictionary *ism_find_matching_stub(NSURLRequest *request) {
+    if (!ism_net_stubs_lock) return nil;
+    [ism_net_stubs_lock lock];
+    NSDictionary *match = nil;
+    NSString *urlStr = request.URL.absoluteString ?: @"";
+    NSString *method = request.HTTPMethod ?: @"GET";
+    for (NSDictionary *stub in ism_net_stubs) {
+        NSString *pat = stub[@"url_substring"];
+        if (![urlStr containsString:pat]) continue;
+        NSString *m = stub[@"method"];
+        if ([m isKindOfClass:[NSString class]] && m.length > 0
+            && [m caseInsensitiveCompare:method] != NSOrderedSame) continue;
+        match = stub;
+        break;
+    }
+    [ism_net_stubs_lock unlock];
+    return match;
+}
+
+static void ism_net_record_mark_stubbed(int64_t recordId, NSNumber *stubId) {
+    if (recordId == 0 || !ism_net_lock) return;
+    [ism_net_lock lock];
+    for (NSMutableDictionary *r in ism_net_records) {
+        if ([r[@"id"] longLongValue] == recordId) {
+            r[@"stubbed"] = @YES;
+            if (stubId) r[@"stub_id"] = stubId;
+            break;
+        }
+    }
+    [ism_net_lock unlock];
+}
+
 static int64_t ism_net_record_started(NSURLRequest *request) {
     if (!ism_url_passes_filter(request.URL)) return 0;
     [ism_net_lock lock];
@@ -732,6 +772,34 @@ static void ism_net_record_completed(int64_t recordId, NSURLResponse *response, 
     _startedAt = [NSDate date];
     _responseData = [NSMutableData data];
     _recordId = ism_net_record_started(self.request);
+
+    // Phase 2f: stub interception. If any registered stub matches this
+    // request, synthesize the canned response and bypass forwarding.
+    NSDictionary *stub = ism_find_matching_stub(self.request);
+    if (stub) {
+        ism_net_record_mark_stubbed(_recordId, stub[@"id"]);
+        NSInteger    status   = [stub[@"status"] integerValue] ?: 200;
+        NSDictionary *headers = [stub[@"headers"] isKindOfClass:[NSDictionary class]] ? stub[@"headers"] : @{};
+        NSData       *body    = [stub[@"body"]    isKindOfClass:[NSData class]]       ? stub[@"body"]    : [NSData data];
+        NSTimeInterval delayMs = [stub[@"delay_ms"] doubleValue];
+
+        __weak typeof(self) weakSelf = self;
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(delayMs * NSEC_PER_MSEC)),
+                       dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+            typeof(self) s = weakSelf;
+            if (!s) return;
+            NSHTTPURLResponse *response = [[NSHTTPURLResponse alloc] initWithURL:s.request.URL
+                                                                       statusCode:status
+                                                                      HTTPVersion:@"HTTP/1.1"
+                                                                     headerFields:headers];
+            s->_responseStartedAt = [NSDate date];
+            [s.client URLProtocol:s didReceiveResponse:response cacheStoragePolicy:NSURLCacheStorageNotAllowed];
+            if (body.length > 0) [s.client URLProtocol:s didLoadData:body];
+            ism_net_record_completed(s->_recordId, response, body, s->_startedAt, s->_responseStartedAt, nil);
+            [s.client URLProtocolDidFinishLoading:s];
+        });
+        return;
+    }
 
     NSMutableURLRequest *forward = [self.request mutableCopy];
     [NSURLProtocol setProperty:@YES forKey:kISMHandledKey inRequest:forward];
@@ -1262,6 +1330,111 @@ static void ism_register_builtins(NSString *bundleId, NSString *processName, NSS
             @"base64": [body base64EncodedStringWithOptions:0],
             @"text": isBin ? @"" : preview,
         };
+    });
+
+    // -------- Network stubbing (Layer 2f) --------
+
+    ism_register_method(@"network_stub_add", ^NSDictionary *(NSDictionary *params) {
+        if (!ism_net_stubs) {
+            ism_net_stubs = [NSMutableArray array];
+            ism_net_stubs_lock = [[NSLock alloc] init];
+        }
+        NSString *urlSubstring = [params[@"url_substring"] isKindOfClass:[NSString class]] ? params[@"url_substring"] : nil;
+        if (!urlSubstring || urlSubstring.length == 0) {
+            @throw [NSException exceptionWithName:@"BadParams" reason:@"url_substring required" userInfo:nil];
+        }
+        NSInteger status = [params[@"status"] isKindOfClass:[NSNumber class]] ? [params[@"status"] integerValue] : 200;
+        NSDictionary *headers = [params[@"headers"] isKindOfClass:[NSDictionary class]] ? params[@"headers"] : @{};
+        NSString *method = [params[@"method"] isKindOfClass:[NSString class]] ? params[@"method"] : nil;
+        NSTimeInterval delayMs = [params[@"delay_ms"] isKindOfClass:[NSNumber class]] ? [params[@"delay_ms"] doubleValue] : 0;
+
+        NSData *body = [NSData data];
+        NSString *bodyPreview = @"";
+        BOOL bodyIsBinary = NO;
+        if ([params[@"body_base64"] isKindOfClass:[NSString class]] && ((NSString *)params[@"body_base64"]).length > 0) {
+            NSData *decoded = [[NSData alloc] initWithBase64EncodedString:params[@"body_base64"] options:0];
+            if (decoded) {
+                body = decoded;
+                NSString *asText = [[NSString alloc] initWithData:decoded encoding:NSUTF8StringEncoding];
+                if (asText) { bodyPreview = asText; } else { bodyIsBinary = YES; }
+            }
+        } else if ([params[@"body"] isKindOfClass:[NSString class]]) {
+            body = [(NSString *)params[@"body"] dataUsingEncoding:NSUTF8StringEncoding] ?: [NSData data];
+            bodyPreview = params[@"body"];
+        }
+
+        [ism_net_stubs_lock lock];
+        int64_t stubId = ++ism_net_next_stub_id;
+        NSMutableDictionary *stub = [@{
+            @"id":            @(stubId),
+            @"url_substring": urlSubstring,
+            @"status":        @(status),
+            @"headers":       headers,
+            @"body":          body,
+            @"body_preview":  bodyPreview,
+            @"body_binary":   @(bodyIsBinary),
+            @"body_bytes":    @(body.length),
+            @"delay_ms":      @(delayMs),
+            @"added_at_ms":   @((long long)([[NSDate date] timeIntervalSince1970] * 1000.0)),
+        } mutableCopy];
+        if (method) stub[@"method"] = method;
+        [ism_net_stubs addObject:stub];
+        NSUInteger count = ism_net_stubs.count;
+        [ism_net_stubs_lock unlock];
+
+        return @{
+            @"id":            @(stubId),
+            @"url_substring": urlSubstring,
+            @"method":        method ?: @"ANY",
+            @"status":        @(status),
+            @"body_bytes":    @(body.length),
+            @"delay_ms":      @(delayMs),
+            @"total_stubs":   @(count),
+        };
+    });
+
+    ism_register_method(@"network_stub_list", ^NSDictionary *(NSDictionary *params) {
+        NSMutableArray *out = [NSMutableArray array];
+        if (ism_net_stubs_lock) {
+            [ism_net_stubs_lock lock];
+            for (NSDictionary *stub in ism_net_stubs) {
+                NSMutableDictionary *m = [stub mutableCopy];
+                [m removeObjectForKey:@"body"]; // raw NSData isn't JSON-able; preview is kept
+                [out addObject:m];
+            }
+            [ism_net_stubs_lock unlock];
+        }
+        return @{@"stubs": out, @"count": @(out.count)};
+    });
+
+    ism_register_method(@"network_stub_remove", ^NSDictionary *(NSDictionary *params) {
+        id idVal = params[@"id"];
+        if (![idVal isKindOfClass:[NSNumber class]]) {
+            @throw [NSException exceptionWithName:@"BadParams" reason:@"id required" userInfo:nil];
+        }
+        int64_t target = [idVal longLongValue];
+        BOOL removed = NO;
+        if (ism_net_stubs_lock) {
+            [ism_net_stubs_lock lock];
+            NSUInteger idx = NSNotFound;
+            for (NSUInteger i = 0; i < ism_net_stubs.count; i++) {
+                if ([ism_net_stubs[i][@"id"] longLongValue] == target) { idx = i; break; }
+            }
+            if (idx != NSNotFound) { [ism_net_stubs removeObjectAtIndex:idx]; removed = YES; }
+            [ism_net_stubs_lock unlock];
+        }
+        return @{@"removed": @(removed), @"id": @(target)};
+    });
+
+    ism_register_method(@"network_stub_clear", ^NSDictionary *(NSDictionary *params) {
+        NSUInteger n = 0;
+        if (ism_net_stubs_lock) {
+            [ism_net_stubs_lock lock];
+            n = ism_net_stubs.count;
+            [ism_net_stubs removeAllObjects];
+            [ism_net_stubs_lock unlock];
+        }
+        return @{@"cleared": @(n)};
     });
 
     ism_register_method(@"network_clear", ^NSDictionary *(NSDictionary *params) {

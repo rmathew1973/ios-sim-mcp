@@ -28,6 +28,7 @@ const TESTS: TestSpec[] = [
   { file: "view_tree.ts",      label: "Layer 2c — view_tree + view_hit_test",     needsDylib: true },
   { file: "network_2d.ts",     label: "Layer 2d — HTTP capture via URLProtocol",  needsDylib: true, needsInternet: true },
   { file: "eval_js.ts",        label: "Layer 2e — JavaScriptCore eval bridge",    needsDylib: true },
+  { file: "network_stubs.ts",  label: "Layer 2f — HTTP stubbing (canned responses)", needsDylib: true, needsInternet: true },
 ];
 
 const DYLIB_PATH = path.resolve(import.meta.dir, "../dylib/build/libios-sim-mcp.dylib");
