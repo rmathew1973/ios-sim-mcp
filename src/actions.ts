@@ -93,6 +93,11 @@ export async function terminateApp(udid: string, bundleId: string): Promise<void
   invalidate();
 }
 
+export async function openUrl(udid: string, url: string): Promise<void> {
+  await runCmd("xcrun", ["simctl", "openurl", udid, url]);
+  invalidate();
+}
+
 export async function screenshot(udid: string, outPath: string): Promise<void> {
   await runIdb(["screenshot", "--udid", udid, outPath]);
 }

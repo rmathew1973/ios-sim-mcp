@@ -24,6 +24,7 @@
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
 #import <JavaScriptCore/JavaScriptCore.h>
+#import <WebKit/WebKit.h>
 #import <os/log.h>
 #import <objc/runtime.h>
 #include <unistd.h>
@@ -523,6 +524,26 @@ static UIView *ism_find_view_by_class(NSString *clsName) {
     return ism_find_view_helper(^BOOL(UIView *v) {
         return [v isKindOfClass:cls];
     });
+}
+
+// Walk all windows collecting every WKWebView, in stable encounter order
+// (window order × DFS subviews). Used by webview_list / webview_eval_js to
+// pick a target by index or accessibilityIdentifier.
+static NSArray<WKWebView *> *ism_find_webviews(void) {
+    NSMutableArray<WKWebView *> *out = [NSMutableArray array];
+    for (UIWindow *w in ism_all_windows()) {
+        NSMutableArray<UIView *> *stack = [NSMutableArray arrayWithObject:w];
+        while (stack.count > 0) {
+            UIView *v = stack.lastObject;
+            [stack removeLastObject];
+            if ([v isKindOfClass:[WKWebView class]]) [out addObject:(WKWebView *)v];
+            // DFS in original child order so siblings are visited left→right.
+            for (NSInteger i = (NSInteger)v.subviews.count - 1; i >= 0; i--) {
+                [stack addObject:v.subviews[(NSUInteger)i]];
+            }
+        }
+    }
+    return out;
 }
 
 static UIViewController *ism_find_vc_by_class(NSString *clsName) {
@@ -1665,6 +1686,167 @@ static void ism_register_builtins(NSString *bundleId, NSString *processName, NSS
             ism_js_ctx = nil; // lazily recreated on next eval_js
         });
         return @{@"reset": @YES};
+    });
+
+    // webview_list: enumerate WKWebView instances in the host app's view
+    // hierarchy. Caller picks one by `index` (encounter order) or by
+    // `ax_id` (matching accessibilityIdentifier) when calling webview_eval_js.
+    // Note: ASWebAuthenticationSession / SFSafariViewController run in a
+    // separate system process and are NOT WKWebViews here — they will not
+    // appear, and there is no in-process way to reach them.
+    ism_register_method(@"webview_list", ^NSDictionary *(NSDictionary *params) {
+        __block NSMutableArray *out = [NSMutableArray array];
+        dispatch_sync(dispatch_get_main_queue(), ^{
+            NSArray<WKWebView *> *webs = ism_find_webviews();
+            for (NSUInteger i = 0; i < webs.count; i++) {
+                WKWebView *wv = webs[i];
+                CGRect f = wv.frame;
+                NSString *url = wv.URL.absoluteString ?: @"";
+                NSString *title = wv.title ?: @"";
+                [out addObject:@{
+                    @"index": @(i),
+                    @"class": NSStringFromClass([wv class]) ?: @"WKWebView",
+                    @"ax_id": wv.accessibilityIdentifier ?: @"",
+                    @"url": url,
+                    @"title": title,
+                    @"frame": @{@"x": @(f.origin.x), @"y": @(f.origin.y),
+                                @"w": @(f.size.width), @"h": @(f.size.height)},
+                    @"hidden": @(wv.hidden || wv.alpha < 0.01),
+                }];
+            }
+        });
+        return @{@"count": @(out.count), @"webviews": out};
+    });
+
+    // webview_eval_js: run a JS snippet inside a WKWebView via
+    // -evaluateJavaScript:completionHandler:. The JS runs in the page context
+    // (full DOM access, no ObjC bridge). Target selection priority:
+    //   ax_id > index > first visible > first.
+    // Returns {ok, kind, value | exception, elapsed_ms, webview_index}.
+    // Result coercion mirrors eval_js: JSON-able → object/array/string/number/
+    // boolean/null; anything else → described string.
+    ism_register_method(@"webview_eval_js", ^NSDictionary *(NSDictionary *params) {
+        id codeVal = params[@"code"];
+        if (![codeVal isKindOfClass:[NSString class]]) {
+            @throw [NSException exceptionWithName:@"BadParams"
+                                           reason:@"`code` must be a string"
+                                         userInfo:nil];
+        }
+        NSString *code = codeVal;
+        id indexVal = params[@"index"];
+        id axIdVal = params[@"ax_id"];
+
+        __block WKWebView *target = nil;
+        __block NSInteger chosenIndex = -1;
+        __block NSString *pickError = nil;
+        dispatch_sync(dispatch_get_main_queue(), ^{
+            NSArray<WKWebView *> *webs = ism_find_webviews();
+            if (webs.count == 0) { pickError = @"no WKWebView found in host app"; return; }
+            if ([axIdVal isKindOfClass:[NSString class]] && [(NSString *)axIdVal length] > 0) {
+                for (NSUInteger i = 0; i < webs.count; i++) {
+                    if ([webs[i].accessibilityIdentifier isEqualToString:axIdVal]) {
+                        target = webs[i]; chosenIndex = (NSInteger)i; return;
+                    }
+                }
+                pickError = [NSString stringWithFormat:@"no WKWebView with ax_id=%@", axIdVal];
+                return;
+            }
+            if ([indexVal isKindOfClass:[NSNumber class]]) {
+                NSInteger idx = [indexVal integerValue];
+                if (idx < 0 || idx >= (NSInteger)webs.count) {
+                    pickError = [NSString stringWithFormat:@"index %ld out of range (count=%lu)", (long)idx, (unsigned long)webs.count];
+                    return;
+                }
+                target = webs[(NSUInteger)idx]; chosenIndex = idx; return;
+            }
+            // Default: first visible, else first.
+            for (NSUInteger i = 0; i < webs.count; i++) {
+                if (!webs[i].hidden && webs[i].alpha >= 0.01) {
+                    target = webs[i]; chosenIndex = (NSInteger)i; return;
+                }
+            }
+            target = webs[0]; chosenIndex = 0;
+        });
+
+        if (pickError) @throw [NSException exceptionWithName:@"WebViewNotFound" reason:pickError userInfo:nil];
+
+        dispatch_semaphore_t sem = dispatch_semaphore_create(0);
+        __block id evalResult = nil;
+        __block NSError *evalError = nil;
+        NSDate *startedAt = [NSDate date];
+
+        dispatch_async(dispatch_get_main_queue(), ^{
+            @try {
+                [target evaluateJavaScript:code completionHandler:^(id result, NSError *err) {
+                    evalResult = result;
+                    evalError = err;
+                    dispatch_semaphore_signal(sem);
+                }];
+            } @catch (NSException *ex) {
+                evalError = [NSError errorWithDomain:@"ios-sim-mcp.webview"
+                                                code:1
+                                            userInfo:@{NSLocalizedDescriptionKey: ex.reason ?: @"eval threw"}];
+                dispatch_semaphore_signal(sem);
+            }
+        });
+        // WKWebView eval can be slow on heavy pages; 4s cap leaves headroom
+        // below the MCP-side default 5s call timeout.
+        long waited = dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, 4 * NSEC_PER_SEC));
+        NSTimeInterval elapsed = -[startedAt timeIntervalSinceNow];
+        if (waited != 0) {
+            return @{
+                @"ok": @NO,
+                @"exception": @"webview JS eval timed out after 4s",
+                @"elapsed_ms": @((long long)(elapsed * 1000.0)),
+                @"webview_index": @(chosenIndex),
+            };
+        }
+        if (evalError) {
+            return @{
+                @"ok": @NO,
+                @"exception": evalError.localizedDescription ?: @"(unknown)",
+                @"elapsed_ms": @((long long)(elapsed * 1000.0)),
+                @"webview_index": @(chosenIndex),
+            };
+        }
+
+        // Coerce WKWebView result (already Foundation types: NSString/NSNumber/
+        // NSArray/NSDictionary/NSNull or nil) to the same {kind,value} shape
+        // eval_js uses.
+        NSString *kind = @"undefined";
+        id value = [NSNull null];
+        if (evalResult == nil) { kind = @"undefined"; value = [NSNull null]; }
+        else if ([evalResult isKindOfClass:[NSNull class]]) { kind = @"null"; }
+        else if ([evalResult isKindOfClass:[NSNumber class]]) {
+            // NSNumber covers both number and boolean in WKWebView land. Use
+            // CFNumber type to disambiguate booleans.
+            CFNumberType t = CFNumberGetType((CFNumberRef)evalResult);
+            if (t == kCFNumberCharType && (strcmp([(NSNumber *)evalResult objCType], @encode(BOOL)) == 0)) {
+                kind = @"boolean"; value = evalResult;
+            } else {
+                kind = @"number"; value = evalResult;
+            }
+        }
+        else if ([evalResult isKindOfClass:[NSString class]]) { kind = @"string"; value = evalResult; }
+        else if ([evalResult isKindOfClass:[NSArray class]]) {
+            kind = @"array";
+            value = [NSJSONSerialization isValidJSONObject:evalResult] ? evalResult : [evalResult description];
+            if (![value isKindOfClass:[NSArray class]]) kind = @"array_described";
+        }
+        else if ([evalResult isKindOfClass:[NSDictionary class]]) {
+            kind = @"object";
+            value = [NSJSONSerialization isValidJSONObject:evalResult] ? evalResult : [evalResult description];
+            if (![value isKindOfClass:[NSDictionary class]]) kind = @"other";
+        }
+        else { kind = @"other"; value = [evalResult description] ?: @""; }
+
+        return @{
+            @"ok": @YES,
+            @"kind": kind,
+            @"value": value,
+            @"elapsed_ms": @((long long)(elapsed * 1000.0)),
+            @"webview_index": @(chosenIndex),
+        };
     });
 
     // network_self_test: verifies the interception path end-to-end by firing

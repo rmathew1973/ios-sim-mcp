@@ -29,6 +29,7 @@ build_slice() {
         -framework Foundation \
         -framework UIKit \
         -framework JavaScriptCore \
+        -framework WebKit \
         -o "$out" \
         "$SRC"
 }

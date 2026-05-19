@@ -756,6 +756,168 @@ server.registerTool("dylib_call", {
   } catch (e) { return err(e); }
 });
 
+server.registerTool("open_url", {
+  description: "Deliver a URL to the simulator via `xcrun simctl openurl`. Routes through the host OS's URL dispatcher, so http(s) URLs open in Safari and custom-scheme URLs (e.g. myapp://oauth/callback?code=...) are delivered to the registered app's URL handler. Primary use: short-circuit an out-of-process auth flow (ASWebAuthenticationSession / SFSafariViewController) by handing the OAuth callback URL directly to the app, then stub the token-endpoint response with network_stub. Also useful for deep-link testing.",
+  inputSchema: { url: z.string() },
+}, async ({ url }) => {
+  try {
+    const udid = await ensureUdid();
+    await actions.openUrl(udid, url);
+    return txt(`opened ${url}`);
+  } catch (e) { return err(e); }
+});
+
+// -------- WKWebView eval bridge (Layer 2 dylib) --------
+
+server.registerTool("webview_list", {
+  description: "Enumerate WKWebView instances currently in the host app's view hierarchy. Returns an array of {index, ax_id, class, url, title, frame, hidden}. Use this to confirm a web view is present and pick one by index/ax_id for webview_eval_js etc. Note: does NOT see SFSafariViewController / ASWebAuthenticationSession (those run in a separate system process and are unreachable). Requires the dylib injected.",
+  inputSchema: { bundle_id: z.string().optional() },
+}, async ({ bundle_id }) => {
+  try {
+    const client = await getDylibClient(bundle_id);
+    const r: any = await client.call("webview_list", {});
+    if (r.count === 0) return txt("(no WKWebView instances found in the host app — if you're seeing a system auth sheet, that's out-of-process; use open_url + network_stub instead)");
+    const lines = r.webviews.map((w: any) =>
+      `#${w.index} ${w.class}  url=${JSON.stringify(w.url || "")}  title=${JSON.stringify(w.title || "")}${w.ax_id ? `  ax_id=${w.ax_id}` : ""}  frame=(${Math.round(w.frame.x)},${Math.round(w.frame.y)} ${Math.round(w.frame.w)}x${Math.round(w.frame.h)})${w.hidden ? "  HIDDEN" : ""}`);
+    return txt(`${r.count} web view(s):\n${lines.join("\n")}`);
+  } catch (e) { return err(e); }
+});
+
+server.registerTool("webview_eval_js", {
+  description: "Run JavaScript in a WKWebView via -[WKWebView evaluateJavaScript:completionHandler:]. The JS runs in the page context — has full DOM access (document, window, etc.) and CAN'T see ObjC bridges. Returns {ok, kind, value} for JSON-able results, or {ok:false, exception} on JS error. Pick the web view by index (from webview_list) or ax_id; defaults to the first visible one. Requires the dylib injected.",
+  inputSchema: {
+    code: z.string(),
+    bundle_id: z.string().optional(),
+    index: z.number().int().nonnegative().optional(),
+    ax_id: z.string().optional(),
+    timeout_ms: z.number().int().positive().optional(),
+  },
+}, async ({ code, bundle_id, index, ax_id, timeout_ms }) => {
+  try {
+    const client = await getDylibClient(bundle_id);
+    const r: any = await client.call("webview_eval_js", { code, index, ax_id }, { timeoutMs: timeout_ms });
+    const head = `[${r.elapsed_ms}ms] ${r.ok ? "ok" : "EXCEPTION"}  kind=${r.kind ?? "—"}  webview#${r.webview_index}`;
+    if (!r.ok) return txt(`${head}\n${r.exception}`);
+    return txt(`${head}\n${JSON.stringify(r.value, null, 2)}`);
+  } catch (e) { return err(e); }
+});
+
+// JS that bypasses React's value-tracker / Angular's NgModel — sets the value
+// via the prototype's native setter and dispatches input+change events.
+// Returns enough metadata that the caller can confirm the right field was hit.
+const WEBVIEW_FILL_JS = `(function(selector, text){
+  var el = document.querySelector(selector);
+  if (!el) return {ok:false, reason:'not_found', selector:selector};
+  var proto = (el instanceof HTMLTextAreaElement) ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+  var desc = Object.getOwnPropertyDescriptor(proto, 'value');
+  if (desc && desc.set) { desc.set.call(el, text); } else { el.value = text; }
+  el.dispatchEvent(new Event('input', {bubbles:true}));
+  el.dispatchEvent(new Event('change', {bubbles:true}));
+  return {ok:true, tag:el.tagName, name:el.name||'', id:el.id||'', value:el.value};
+})(__selector, __text)`;
+
+const WEBVIEW_CLICK_JS = `(function(selector){
+  var el = document.querySelector(selector);
+  if (!el) return {ok:false, reason:'not_found', selector:selector};
+  var r = el.getBoundingClientRect();
+  if (typeof el.click === 'function') el.click();
+  else el.dispatchEvent(new MouseEvent('click', {bubbles:true, cancelable:true, view:window}));
+  return {ok:true, tag:el.tagName, id:el.id||'', text:(el.innerText||el.value||'').slice(0,80), rect:{x:r.left,y:r.top,w:r.width,h:r.height}};
+})(__selector)`;
+
+const WEBVIEW_FIND_JS = `(function(selector, limit){
+  var nodes = document.querySelectorAll(selector);
+  var out = [];
+  for (var i=0; i<nodes.length && i<limit; i++) {
+    var el = nodes[i];
+    var r = el.getBoundingClientRect();
+    out.push({
+      tag: el.tagName,
+      id: el.id || '',
+      name: el.name || '',
+      type: el.type || '',
+      text: (el.innerText || el.value || '').slice(0,120),
+      rect: {x:r.left,y:r.top,w:r.width,h:r.height},
+      visible: !!(r.width || r.height) && getComputedStyle(el).visibility !== 'hidden',
+    });
+  }
+  return {ok:true, count:nodes.length, items:out};
+})(__selector, __limit)`;
+
+function buildWebviewJs(template: string, params: Record<string, unknown>): string {
+  // Inline params as JSON literals into the snippet — saves a round-trip and
+  // keeps the dylib API minimal (it only knows how to eval code).
+  let out = template;
+  for (const [k, v] of Object.entries(params)) {
+    out = out.replace(new RegExp("__" + k + "\\b", "g"), JSON.stringify(v));
+  }
+  return out;
+}
+
+server.registerTool("webview_fill", {
+  description: "Fill a form field inside a WKWebView. Uses the React/Angular-safe pattern: sets the input value via HTMLInputElement.prototype's native setter (bypasses React's synthetic value tracker), then dispatches input + change events. selector is a CSS selector (e.g. 'input[name=email]', '#password'). Returns {ok, tag, name, id, value} so you can confirm the right field was hit. Requires the dylib injected and a WKWebView present (see webview_list).",
+  inputSchema: {
+    selector: z.string(),
+    text: z.string(),
+    bundle_id: z.string().optional(),
+    index: z.number().int().nonnegative().optional(),
+    ax_id: z.string().optional(),
+  },
+}, async ({ selector, text, bundle_id, index, ax_id }) => {
+  try {
+    const client = await getDylibClient(bundle_id);
+    const code = buildWebviewJs(WEBVIEW_FILL_JS, { selector, text });
+    const r: any = await client.call("webview_eval_js", { code, index, ax_id });
+    if (!r.ok) return txt(`EXCEPTION  ${r.exception}`);
+    if (r.value && r.value.ok === false) return txt(`(no element matched ${selector})`);
+    return txt(`filled ${text.length} chars into ${r.value.tag}${r.value.id ? "#" + r.value.id : ""}${r.value.name ? `[name=${r.value.name}]` : ""}  (webview#${r.webview_index})`);
+  } catch (e) { return err(e); }
+});
+
+server.registerTool("webview_click", {
+  description: "Click an element inside a WKWebView. Calls element.click() when available, otherwise dispatches a synthesized MouseEvent. selector is a CSS selector. Returns {ok, tag, id, text, rect}. Requires the dylib injected.",
+  inputSchema: {
+    selector: z.string(),
+    bundle_id: z.string().optional(),
+    index: z.number().int().nonnegative().optional(),
+    ax_id: z.string().optional(),
+  },
+}, async ({ selector, bundle_id, index, ax_id }) => {
+  try {
+    const client = await getDylibClient(bundle_id);
+    const code = buildWebviewJs(WEBVIEW_CLICK_JS, { selector });
+    const r: any = await client.call("webview_eval_js", { code, index, ax_id });
+    if (!r.ok) return txt(`EXCEPTION  ${r.exception}`);
+    if (r.value && r.value.ok === false) return txt(`(no element matched ${selector})`);
+    const v = r.value;
+    return txt(`clicked ${v.tag}${v.id ? "#" + v.id : ""}  text=${JSON.stringify(v.text)}  (webview#${r.webview_index})`);
+  } catch (e) { return err(e); }
+});
+
+server.registerTool("webview_find", {
+  description: "querySelectorAll inside a WKWebView. Returns matching elements with tag, id, name, type, inner text/value, bounding rect, and visibility. Useful for sanity-checking 'is the email field actually rendered?' before webview_fill, or for enumerating multiple matches. Requires the dylib injected.",
+  inputSchema: {
+    selector: z.string(),
+    bundle_id: z.string().optional(),
+    index: z.number().int().nonnegative().optional(),
+    ax_id: z.string().optional(),
+    limit: z.number().int().positive().optional(),
+  },
+}, async ({ selector, bundle_id, index, ax_id, limit }) => {
+  try {
+    const client = await getDylibClient(bundle_id);
+    const code = buildWebviewJs(WEBVIEW_FIND_JS, { selector, limit: limit ?? 25 });
+    const r: any = await client.call("webview_eval_js", { code, index, ax_id });
+    if (!r.ok) return txt(`EXCEPTION  ${r.exception}`);
+    const v = r.value;
+    if (v.count === 0) return txt(`(no matches for ${selector} in webview#${r.webview_index})`);
+    const lines = v.items.map((it: any, i: number) =>
+      `  ${i + 1}. ${it.tag}${it.id ? "#" + it.id : ""}${it.name ? `[name=${it.name}]` : ""}${it.type ? `[type=${it.type}]` : ""}  text=${JSON.stringify(it.text)}  rect=(${Math.round(it.rect.x)},${Math.round(it.rect.y)} ${Math.round(it.rect.w)}x${Math.round(it.rect.h)})${it.visible ? "" : "  HIDDEN"}`);
+    const more = v.count > v.items.length ? `\n  … ${v.count - v.items.length} more (raise limit)` : "";
+    return txt(`${v.count} match(es) for ${selector} in webview#${r.webview_index}:\n${lines.join("\n")}${more}`);
+  } catch (e) { return err(e); }
+});
+
 server.registerTool("terminate_app", {
   description: "Terminate an app by bundle id.",
   inputSchema: { bundle_id: z.string() },
