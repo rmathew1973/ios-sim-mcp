@@ -39,3 +39,6 @@ ios-sim-*.png
 
 # Built dylib artifacts (rebuilt via dylib/build.sh)
 dylib/build/
+
+# Claude Code local settings
+.claude/settings.local.json
